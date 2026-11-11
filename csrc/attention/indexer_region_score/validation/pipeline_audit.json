@@ -1,0 +1,75 @@
+{
+  "scope": "Standard model/derived cases; layout-cost experiment separately includes conversion tasks",
+  "sessions": [
+    {
+      "manifest": "/tmp/irs-api/perf/all-api5-b0.json",
+      "operator_counts": {
+        "ArgMaxV2": 201,
+        "IndexerRegionScore": 140,
+        "VllmAscendIndexerRegionScore": 140
+      },
+      "all_operator_rows": 481,
+      "all_task_rows": 485,
+      "extra_operator_rows": [],
+      "unmatched_tasks_after_first_kernel": [],
+      "no_extra_copy_or_conversion_kernels": true,
+      "scope": "Full op_summary plus task_time; startup-only tasks are retained separately"
+    },
+    {
+      "manifest": "/tmp/irs-api/perf/all-api5-b1.json",
+      "operator_counts": {
+        "ArgMaxV2": 201,
+        "IndexerRegionScore": 140,
+        "VllmAscendIndexerRegionScore": 140
+      },
+      "all_operator_rows": 481,
+      "all_task_rows": 485,
+      "extra_operator_rows": [],
+      "unmatched_tasks_after_first_kernel": [],
+      "no_extra_copy_or_conversion_kernels": true,
+      "scope": "Full op_summary plus task_time; startup-only tasks are retained separately"
+    },
+    {
+      "manifest": "/tmp/irs-api/perf/all-api5-b2.json",
+      "operator_counts": {
+        "ArgMaxV2": 121,
+        "IndexerRegionScore": 84,
+        "VllmAscendIndexerRegionScore": 84
+      },
+      "all_operator_rows": 289,
+      "all_task_rows": 293,
+      "extra_operator_rows": [],
+      "unmatched_tasks_after_first_kernel": [],
+      "no_extra_copy_or_conversion_kernels": true,
+      "scope": "Full op_summary plus task_time; startup-only tasks are retained separately"
+    },
+    {
+      "manifest": "/tmp/irs-api/perf/derived-api5-b0.json",
+      "operator_counts": {
+        "ArgMaxV2": 41,
+        "IndexerRegionScore": 28,
+        "VllmAscendIndexerRegionScore": 28
+      },
+      "all_operator_rows": 97,
+      "all_task_rows": 101,
+      "extra_operator_rows": [],
+      "unmatched_tasks_after_first_kernel": [],
+      "no_extra_copy_or_conversion_kernels": true,
+      "scope": "Full op_summary plus task_time; startup-only tasks are retained separately"
+    },
+    {
+      "manifest": "/tmp/irs-api/perf/variable-api5.json",
+      "operator_counts": {
+        "ArgMaxV2": 61,
+        "IndexerRegionScore": 42,
+        "VllmAscendIndexerRegionScore": 42
+      },
+      "all_operator_rows": 145,
+      "all_task_rows": 149,
+      "extra_operator_rows": [],
+      "unmatched_tasks_after_first_kernel": [],
+      "no_extra_copy_or_conversion_kernels": true,
+      "scope": "Full op_summary plus task_time; startup-only tasks are retained separately"
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+case_id,physical_device,contiguous_score_kernel_us,strided_score_kernel_us,contiguous_pipeline_task_sum_us,strided_pipeline_task_sum_us,strided_over_contiguous
+irs256_bf16_s01_full_n1_q1024,5,17.613500000000002,15.978,17.613500000000002,59.659,3.387117835750986

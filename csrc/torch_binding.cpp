@@ -44,6 +44,7 @@
 #include "attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h"
 #include "attention/kv_compress_epilog_v2/kv_compress_epilog_v2_torch_adpt.h"
 #include "attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h"
+#include "attention/indexer_region_score/indexer_region_score_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention_vllm/kv_quant_sparse_flash_attention_vllm_torch_adpt.h"
 #include "attention/fused_sparse_attention_overlap/fused_sparse_attention_overlap_torch_adpt.h"
 #include "attention/fused_lightning_indexer_manage/fused_lightning_indexer_manage_torch_adpt.h"
@@ -3029,6 +3030,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_fused_quant_lightning_indexer_manage", torch::kPrivateUse1,
              &vllm_ascend::npu_fused_quant_lightning_indexer_manage);
+
+    ops.def(
+        "npu_indexer_region_score(Tensor query, Tensor weights, Tensor key_summary, "
+        "Tensor actual_kv_lengths, Tensor block_table, Tensor cu_seq_lens, "
+        "int max_region_len, int top_k=512, int region_size=8, float head_scale=1.0, "
+        "int cache_mode=1, int mask_mode=3, int sort_mode=1, "
+        "Tensor(a!)? out=None, Tensor(b!)? selected_region_ids=None) -> (Tensor(a), Tensor(b))"
+    );
+    ops.impl("npu_indexer_region_score", torch::kPrivateUse1, &vllm_ascend::npu_indexer_region_score);
 
     // k2q_csr: q2k -> k2q CSR (Meta/Hist/RowPrefix/TilePrefix/Scatter)
     ops.def(

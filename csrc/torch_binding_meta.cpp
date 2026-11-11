@@ -1720,6 +1720,28 @@ std::tuple<at::Tensor, at::Tensor> grouped_matmul_situ_quant_list_meta(
     return make_grouped_matmul_situ_quant_meta_output(x, n);
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_indexer_region_score_meta(
+    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &keySummary,
+    const at::Tensor &actualKvLengths, const at::Tensor &blockTable, const at::Tensor &cuSeqLens,
+    int64_t maxRegionLen, int64_t topK, int64_t regionSize, double headScale,
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode,
+    const c10::optional<at::Tensor> &out, const c10::optional<at::Tensor> &selectedIds)
+{
+    TORCH_CHECK(cacheMode == 1 && maskMode == 3 && sortMode == 1,
+        "only cache_mode=1, mask_mode=3 and sort_mode=1 are supported");
+    TORCH_CHECK(query.dim() == 4 && query.sym_size(1) > 0 &&
+        (query.sym_size(1) == 1 || query.sym_size(1) % 4 == 0) && query.sym_size(2) >= 4 &&
+        query.sym_size(2) <= 128 && query.sym_size(2) % 4 == 0 && query.sym_size(3) == 256,
+        "query must be [T,G,H,256], G=1 or a positive multiple of 4, H=4..128 in steps of 4");
+    TORCH_CHECK(maxRegionLen >= 0 && maxRegionLen <= 16777216 && topK > 0 && topK <= 512 &&
+        regionSize > 0, "invalid indexer_region_score attributes");
+    auto scores = out.has_value() ? *out : at::empty_symint(
+        {query.sym_size(1), query.sym_size(0), maxRegionLen}, query.options().dtype(at::kFloat));
+    auto ids = selectedIds.has_value() ? *selectedIds : at::empty_symint(
+        {query.sym_size(1), query.sym_size(0), topK}, query.options().dtype(at::kInt));
+    return {scores, ids};
+}
+
 void npu_fused_quant_lightning_indexer_manage_meta(
     const at::Tensor &index_weights,
     const at::Tensor &query_dequant_scale,
@@ -1816,6 +1838,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::npu_generic_block_sparse_attention_meta);
     ops.impl("npu_sparse_flash_mla_metadata", &vllm_ascend::meta::npu_sparse_flash_mla_metadata_meta);
     ops.impl("npu_sparse_flash_mla", &vllm_ascend::meta::npu_sparse_flash_mla_meta);
+    ops.impl("npu_indexer_region_score", &vllm_ascend::meta::npu_indexer_region_score_meta);
     ops.impl("npu_k2q_csr", &vllm_ascend::meta::npu_k2q_csr_meta);
     ops.impl("npu_sparse_attention_score_prefill",
              &vllm_ascend::meta::npu_sparse_attention_score_prefill_meta);

@@ -1,0 +1,462 @@
+{
+  "date": "2026-11-10",
+  "timezone": "Asia/Shanghai",
+  "hardware": "Ascend950PR",
+  "physical_device": 5,
+  "cann_version": "9.2.0",
+  "scope": "msprof op_summary target kernel duration; Python/event time is not the result",
+  "input_distribution": "Q/K integers [-8,8]/8; W integers [1,8]/8; all exactly representable",
+  "page_pattern": "contiguous",
+  "model_dimensions": {
+    "G": 1,
+    "H": 4,
+    "D": 256,
+    "top_k": 512,
+    "region_size": 8,
+    "head_scale": 1.0,
+    "weights_dtype": "float32"
+  },
+  "cache_mode": 1,
+  "mask_mode": 3,
+  "sort_mode": 1,
+  "order": "old,new,new,old (ABBA)",
+  "samples_per_implementation_per_case": 10,
+  "adjacent_warmup": "aclnnArgMax on 256MiB FP16 before every profile target",
+  "cases": 26,
+  "samples": 520,
+  "verification": "26/26 bitwise visible scores and exact logical IDs PASS",
+  "improved_cases": 26,
+  "slower_cases": 0,
+  "geomean_speedup": 1.1382586614344241,
+  "minimum_speedup": 1.040273215885339,
+  "maximum_speedup": 1.2893244775635835,
+  "source_metadata_sha256": "24158e6851cd21a32e04e3e5e76f7d79e519daed805888e067371f222151215a",
+  "runner_sha256": "0e872d66e69a9422d0e83fe37f85fbd91f196b638c23d25dd9ec243094441f57",
+  "acl_helper_sha256": "7c3af9e6dd67112c0d4966e5aa4cb4a463d93ba64c5b1b342a2e291c18a84ddb",
+  "packages": {
+    "old": {
+      "opapi_sha256": "57b06c10fa78c89aa2e74603428280566440cfe5555b111af9c8416b4bec8954",
+      "tree_sha256": "b66973fe23cf29241e544e15cc172b4abc545f94aae115e59d58ba800ec957bc"
+    },
+    "new": {
+      "opapi_sha256": "07eb7b8dac914edbf4f5f62acb8233f5fe3fc96133c0f471483455839717263a",
+      "tree_sha256": "f08867ae49fed1f3caac3d54edf4067acc0e47a077723a84943950159391ac3a"
+    }
+  },
+  "source_baseline": {
+    "repository": "ops-transformer",
+    "operator": "experimental/attention/indexer_region_score",
+    "archive": "indexer_region_score_contiguous_regression_20261109/outline_fix/package_920"
+  },
+  "raw_artifacts": "/tmp/irs-api/perf",
+  "code_sha256": {
+    "csrc/attention/indexer_region_score/CMakeLists.txt": "b2606562bf4cf2c014e8689eca913a80384a52452c7f6cb789ebb7cb8fcf093a",
+    "csrc/attention/indexer_region_score/indexer_region_score_torch_adpt.h": "82f36f5e2474dc6d5ddd6eaa2426eac263b374011db70cc3ce923dcc2cbc6ed2",
+    "csrc/attention/indexer_region_score/op_host/CMakeLists.txt": "b5a51fe7fd208f67b55f5b1630d72493eebc5ce9931b76f910ed4f6cdfa1b015",
+    "csrc/attention/indexer_region_score/op_host/indexer_region_score_shard_plan.h": "09f5a559777a87937fd561d6a5e882eabca40cad20e9b17d1e1aaeaee0fbf70c",
+    "csrc/attention/indexer_region_score/op_host/op_api/aclnn_vllm_ascend_indexer_region_score.cpp": "d9b5683fc6decd9ffc8b81e9d1c34c5f2649f7e3739bc8437483f0bc7b74ff73",
+    "csrc/attention/indexer_region_score/op_host/op_api/aclnn_vllm_ascend_indexer_region_score.h": "52e76837ee64243543b0f2707cd3cb6f00ec5d8a4a59c9b6e9e995ce0412b38a",
+    "csrc/attention/indexer_region_score/op_host/vllm_ascend_indexer_region_score_def.cpp": "5fc7236c122ca3bdec11c52e5f5c16b3f37406f83bf4fd39d9d5eeeeb08539e0",
+    "csrc/attention/indexer_region_score/op_host/vllm_ascend_indexer_region_score_infershape.cpp": "8521758e294ac428a48b3666442331f8522d395df88bc2534bc8d6e8fc44abb0",
+    "csrc/attention/indexer_region_score/op_host/vllm_ascend_indexer_region_score_tiling.cpp": "a7499c33fa258178f31780560410e2c8f4382baedbd7d6c107b3a3f3741232b2",
+    "csrc/attention/indexer_region_score/op_kernel/indexer_region_score_common.h": "61646c948457e609a11e33a1ab39162036dfc8a826fcbb468f3d28bd718534fc",
+    "csrc/attention/indexer_region_score/op_kernel/indexer_region_score_paged.h": "96bad8b08e63263d6d65bd754523f6c99d755a8a0362358f16dd6584c1a0edf6",
+    "csrc/attention/indexer_region_score/op_kernel/indexer_region_score_paged_tiling_data.h": "d20e68985aabaff0aec9b301f44ea15bea2d376e6a678a019f5e68caece3423b",
+    "csrc/attention/indexer_region_score/op_kernel/indexer_region_score_select.h": "148131d457fa1deb7ab752190b6540d8f12d398c1afa7ba1da035c2b560faec1",
+    "csrc/attention/indexer_region_score/op_kernel/vllm_ascend_indexer_region_score.cpp": "ba2e47e6b9694e8076c6016b98eb7265b149732c383619190371b14260d43d41",
+    "csrc/cmake/func.cmake": "8f6d5d45c0f5e3050060c578ed554b3626a0250f7c93ac923319230206b76e45",
+    "csrc/torch_binding.cpp": "4e13f73f4248790b18bbba911ef7c18f10850cf1c10650cc2edc6c5f8c366520",
+    "csrc/torch_binding_meta.cpp": "ee602bde2786d72da55158cdcc02be44a92693b67b0238fc7732ca163c357815",
+    "vllm_ascend/ops/indexer_region_score.py": "850990137d03d98d28e90343313c10116c1dc6886df0e6fc7c84577626208bd6"
+  },
+  "artifacts_sha256": {
+    "fp8_prefill.csv": "bb4a52a3f6bc95fdc82357fc18d7299e61534dacd6b294b0b6654fd366e73f36",
+    "fp8_prefill_samples.csv": "89d6a9887183ac6df204e870ef7f298a687f8e93ae937cac451ce3a8d107e2e3",
+    "layout_cost.csv": "d3e08f3a1d0ab6acbef2ef873693a9f8da187ed74b15015118ced157a1d658ca",
+    "layout_cost_samples.csv": "28dbe9b2bd365aed32bee6d8bf84b227e0fcc1e1f1209a8afa5c88360b112bb6",
+    "performance.csv": "14b3498d030854f6c040783d11f5bf8cf9cd73573fd36d48fddc943fba18cbf7",
+    "performance_samples.csv": "dd6912b7e13cf2fd8d55bbc67bb70f5e532a8a9f534ad0004ad4f28d09284a8d",
+    "pipeline_audit.json": "8308e4984336c292600af7a1158890428c74977ecbb3bae866cd94beda8d52d8",
+    "previous_migration.csv": "e70b1cd450f15466c0e100413ed7ecafc1be0ba185804cfe40c1cfb2a9da60fd",
+    "variable_groups_heads.csv": "53853f855261f4e156fb75d374f21b6245c232f300f10dcb16f26a7c0873223c",
+    "variable_groups_heads_samples.csv": "2b0224eee87a496dc2777b94553a90d70f00132161b765659774a24e119d6877"
+  },
+  "derived_fp8_prefill_cases": 2,
+  "derived_fp8_prefill_included_in_main_statistics": false,
+  "supported_dimensions": {
+    "G": "1 or a positive multiple of 4",
+    "H": "4 through 128, inclusive, in steps of 4",
+    "D": 256,
+    "key": "key_summary [P,S,1,256], shared across groups"
+  },
+  "correctness": {
+    "npu_cases": 235,
+    "physical_device": 0,
+    "python_unit_tests": 6,
+    "python_subtests": 12,
+    "extra_unaligned_id_checks": 35,
+    "meta": "symbolic group/token dimensions and preallocated aliases PASS",
+    "shard_plan_regressions": 280
+  },
+  "code_lines": 3465,
+  "previous_migration_comparison": {
+    "measurement": "separate-process v5/GH/GH/v5 sessions; identical regenerated inputs and source precision control; each target preceded by 256MiB ArgMax warmup",
+    "samples_per_version_case": 10,
+    "cases": 3,
+    "geomean_gh_over_v5": 1.0000960105945844,
+    "packages": {
+      "v5": {
+        "root": "/tmp/irs-package-v5/vendors/irs_vllm_migration_transformer",
+        "opapi_sha256": "4380568ed494486b1c51d113bc0f2a8f9991fbbceb86d4bc6917bde95866bdb7",
+        "tree_sha256": "1843d7ee155612b1659bcde8d92c4a1dc359cc49ad73f0d451d6b27e12429677"
+      },
+      "gh": {
+        "root": "/tmp/irs-package-gh1/vendors/irs_vllm_migration_transformer",
+        "opapi_sha256": "4380568ed494486b1c51d113bc0f2a8f9991fbbceb86d4bc6917bde95866bdb7",
+        "tree_sha256": "60de72e22476b66edecac4c655d8ec0f0940332239d5d5a0cf078e34cc9f2445"
+      }
+    },
+    "sessions": [
+      {
+        "version": "v5",
+        "manifest": "/tmp/irs-gh/perf/representative-v5-a-b0.json",
+        "physical_device": 5
+      },
+      {
+        "version": "gh",
+        "manifest": "/tmp/irs-gh/perf/representative-gh-b-b0.json",
+        "physical_device": 5
+      },
+      {
+        "version": "gh",
+        "manifest": "/tmp/irs-gh/perf/representative-gh-c-b0.json",
+        "physical_device": 5
+      },
+      {
+        "version": "v5",
+        "manifest": "/tmp/irs-gh/perf/representative-v5-d-b0.json",
+        "physical_device": 5
+      }
+    ],
+    "input_sha256": {
+      "irs256_bf16_s01_full_n1_q1024": "0af6fcb33c2bac0101166d8a1cea72bf80cb72008e9c4a4468f91feeb3848a43",
+      "irs256_bf16_s06_prefix128k_q256": "8b9128f0c1a5c3eeea63b008912d5b7788649b5c711c5ac1520637eea58a407f",
+      "score0_irs_fp8_D256_R9000": "d89c6d898570f2aa88a90d02e0407764d13f49dab5abc3a8febf5b62f16fe14a"
+    },
+    "results": [
+      {
+        "case_id": "irs256_bf16_s01_full_n1_q1024",
+        "v5_median_us": 18.2035,
+        "gh_median_us": 17.6055,
+        "gh_over_v5": 0.9671491746092785,
+        "v5_samples_us": [
+          19.031,
+          18.8,
+          18.365,
+          18.514,
+          17.549,
+          18.042,
+          18.71,
+          17.455,
+          16.387,
+          17.726
+        ],
+        "gh_samples_us": [
+          17.229,
+          16.575,
+          16.944,
+          16.909,
+          18.65,
+          17.166,
+          17.982,
+          18.425,
+          19.49,
+          19.631
+        ]
+      },
+      {
+        "case_id": "irs256_bf16_s06_prefix128k_q256",
+        "v5_median_us": 87.6815,
+        "gh_median_us": 88.86449999999999,
+        "gh_over_v5": 1.013492013708707,
+        "v5_samples_us": [
+          86.856,
+          88.297,
+          87.421,
+          87.505,
+          88.009,
+          87.881,
+          86.718,
+          86.737,
+          88.877,
+          87.858
+        ],
+        "gh_samples_us": [
+          88.831,
+          88.688,
+          90.031,
+          88.997,
+          89.231,
+          87.608,
+          88.898,
+          88.294,
+          89.901,
+          88.454
+        ]
+      },
+      {
+        "case_id": "score0_irs_fp8_D256_R9000",
+        "v5_median_us": 122.8535,
+        "gh_median_us": 125.3715,
+        "gh_over_v5": 1.020495956566154,
+        "v5_samples_us": [
+          120.783,
+          125.131,
+          126.802,
+          121.381,
+          123.374,
+          123.998,
+          120.986,
+          122.333,
+          125.775,
+          122.201
+        ],
+        "gh_samples_us": [
+          123.384,
+          127.184,
+          126.398,
+          127.511,
+          124.345,
+          126.82,
+          127.764,
+          121.163,
+          122.012,
+          118.894
+        ]
+      }
+    ],
+    "historical_before_api_compatibility_update": true
+  },
+  "variable_groups_heads": {
+    "cases": 3,
+    "samples": 60,
+    "included_in_main_statistics": false,
+    "verification": "3/3 bitwise visible scores and exact logical IDs PASS",
+    "results": [
+      {
+        "case_id": "derived_G4_H12_T16_R2048_fp16",
+        "old_median_us": 28.784,
+        "new_median_us": 31.067,
+        "new_over_old": 1.0793148971650917,
+        "speedup": 0.9265136640164805,
+        "old_samples_us": [
+          28.775,
+          29.069,
+          28.793,
+          28.739,
+          28.254,
+          29.727,
+          28.138,
+          29.622,
+          28.645,
+          30.019
+        ],
+        "new_samples_us": [
+          31.294,
+          30.84,
+          31.345,
+          30.472,
+          31.35,
+          30.4,
+          31.402,
+          30.634,
+          31.309,
+          30.673
+        ]
+      },
+      {
+        "case_id": "derived_G4_H128_T8_R2048_bf16",
+        "old_median_us": 104.92349999999999,
+        "new_median_us": 101.7375,
+        "new_over_old": 0.9696350198001402,
+        "speedup": 1.0313158864725396,
+        "old_samples_us": [
+          105.168,
+          105.423,
+          104.147,
+          106.085,
+          104.896,
+          104.951,
+          103.923,
+          106.002,
+          104.576,
+          103.971
+        ],
+        "new_samples_us": [
+          101.925,
+          101.256,
+          102.391,
+          101.275,
+          102.089,
+          101.104,
+          102.3,
+          101.55,
+          102.274,
+          101.251
+        ]
+      },
+      {
+        "case_id": "derived_G8_H64_T8_R2048_fp8",
+        "old_median_us": 75.714,
+        "new_median_us": 72.90700000000001,
+        "new_over_old": 0.9629262751934915,
+        "speedup": 1.038501104146378,
+        "old_samples_us": [
+          75.943,
+          76.078,
+          75.313,
+          76.284,
+          75.126,
+          75.71,
+          74.703,
+          76.206,
+          75.021,
+          75.718
+        ],
+        "new_samples_us": [
+          73.856,
+          72.821,
+          73.528,
+          72.878,
+          73.385,
+          72.422,
+          73.502,
+          72.815,
+          72.936,
+          72.695
+        ]
+      }
+    ],
+    "limitation": "G4 H12 T16 R2048 FP16 is 7.93% slower than the source group-fused path"
+  },
+  "code_lines_components": {
+    "kernel_and_shared_pod": 2687,
+    "host_aclnn_torch_adapter_operator_cmake": 674,
+    "python_api": 63,
+    "existing_registration_meta_cmake_additions": 41
+  },
+  "test_code_sha256": {
+    "tests/ut/ops/test_indexer_region_score.py": "daa3f2b4c781f28606104cd62244121fa8f53ad020b2395f46c31127d2bc0475",
+    "tests/e2e/nightly/single_node/ops/singlecard_ops/test_indexer_region_score.py": "1e6a9d54632ed188e64b32aa7ba73de39e1487c36b2201e1c621c6a4b8940818"
+  },
+  "api": {
+    "key_argument": "key_summary",
+    "cache_mode": 1,
+    "mask_mode": 3,
+    "sort_mode": 1,
+    "other_modes": "rejected",
+    "noncontiguous_inputs": "Contiguous as required; compatible paged views retain zero-copy access",
+    "noncontiguous_outputs": "ViewCopy into caller buffers",
+    "unaligned_qk": "TensorMove into aligned storage when necessary"
+  },
+  "layout_cost": {
+    "cases": 1,
+    "samples": 20,
+    "comparison": "Same API5 binary, old=contiguous storage, new=strided input/output views; both cache_mode=1",
+    "included_in_main_statistics": false,
+    "results": [
+      {
+        "case_id": "irs256_bf16_s01_full_n1_q1024",
+        "old_score_kernel_median_us": 17.613500000000002,
+        "old_score_kernel_samples_us": [
+          17.559,
+          17.765,
+          17.596,
+          18.353,
+          19.291,
+          18.211,
+          17.619,
+          17.082,
+          17.608,
+          17.154
+        ],
+        "old_pipeline_task_sum_median_us": 17.613500000000002,
+        "old_pipeline_task_sum_samples_us": [
+          17.559,
+          17.765,
+          17.596,
+          18.353,
+          19.291,
+          18.211,
+          17.619,
+          17.082,
+          17.608,
+          17.154
+        ],
+        "old_pipeline_task_span_median_us": 17.75,
+        "old_pipeline_task_span_samples_us": [
+          17.5,
+          17.75,
+          17.5,
+          18.25,
+          19.25,
+          18.25,
+          17.75,
+          17.0,
+          17.75,
+          17.0
+        ],
+        "old_operator_types": [
+          "VllmAscendIndexerRegionScore"
+        ],
+        "new_score_kernel_median_us": 15.978,
+        "new_score_kernel_samples_us": [
+          15.998,
+          14.901,
+          15.925,
+          16.665,
+          15.958,
+          17.564,
+          14.883,
+          17.124,
+          15.427,
+          16.599
+        ],
+        "new_pipeline_task_sum_median_us": 59.659,
+        "new_pipeline_task_sum_samples_us": [
+          59.443000000000005,
+          58.789,
+          59.906000000000006,
+          59.855000000000004,
+          59.681,
+          62.144,
+          58.60399999999999,
+          60.609,
+          59.328,
+          59.637
+        ],
+        "new_pipeline_task_span_median_us": 60.75,
+        "new_pipeline_task_span_samples_us": [
+          69.5,
+          60.25,
+          61.0,
+          61.75,
+          60.0,
+          64.75,
+          60.5,
+          61.5,
+          59.5,
+          60.0
+        ],
+        "new_operator_types": [
+          "Slice",
+          "StridedSlice",
+          "ViewCopy",
+          "VllmAscendIndexerRegionScore"
+        ],
+        "pipeline_new_over_old": 3.387117835750986
+      }
+    ]
+  },
+  "device_pipeline_audit": "pipeline_audit.json"
+}

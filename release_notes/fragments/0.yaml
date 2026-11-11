@@ -1,0 +1,11 @@
+# Rename this fragment and replace pr when a PR number is assigned.
+pr: 0
+entries:
+  - category: feature
+    text: >-
+      Added a Python interface for paged indexer region scoring and logical region
+      selection on Ascend950, with native FP16, BF16, and FP8 E4M3FN inputs,
+      variable query groups and heads for D=256 models, and noncontiguous tensor
+      views. The interface uses key_summary and retains cache_mode, mask_mode,
+      and sort_mode, currently supporting values 1, 3, and 1 respectively.
+    hardware: [A5]

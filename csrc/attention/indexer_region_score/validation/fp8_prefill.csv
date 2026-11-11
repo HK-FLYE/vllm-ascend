@@ -1,0 +1,3 @@
+case_id,old_median_us,new_median_us,new_over_old,speedup
+derived_irs256_fp8_s01_full_n1_q1024,63.9925,20.1665,0.3151384927921241,3.173208043041678
+derived_irs256_fp8_s06_prefix128k_q256,74.304,62.547,0.8417716408268733,1.1879706460741524
