@@ -2,6 +2,7 @@
 
 import importlib
 import importlib.util
+import sys
 from itertools import product
 from pathlib import Path
 
@@ -34,13 +35,9 @@ def region_score():
     path = Path(__file__).resolve().parents[6] / "vllm_ascend/ops/indexer_region_score.py"
     spec = importlib.util.spec_from_file_location("paged_region_score_wrapper", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module.indexer_region_score
-
-
-@pytest.fixture(scope="module")
-def region_score_topk(region_score):
-    return region_score.__globals__["indexer_region_score_topk"]
 
 
 def make_inputs(
@@ -168,25 +165,26 @@ def test_paged_region_score(region_score, dtype, weight_dtype, query_lengths, re
 
 
 @pytest.mark.parametrize("dtype", QK_DTYPES)
-def test_topk_only_matches_full_score_and_supports_preallocated_ids(region_score, region_score_topk, dtype):
+def test_topk_only_matches_full_score_and_supports_preallocated_ids(region_score, dtype):
     query, weights, backing, lengths, table, cu = make_inputs(
         dtype, torch.float32, (4,), 65, 16, (65,), groups=4, heads=12
     )
     inputs = tuple(tensor.npu() for tensor in (query, weights, backing[:, 1], lengths, table, cu))
-    scores, expected_ids = region_score(*inputs, max_region_len=65, top_k=17, head_scale=0.5)
+    out = torch.empty((4, 4, 65), dtype=torch.float32, device=inputs[0].device)
+    scores, expected_ids = region_score(*inputs, max_region_len=65, top_k=17, head_scale=0.5, out=out)
     del scores
     torch.npu.synchronize()
 
-    ids = region_score_topk(*inputs, max_region_len=65, top_k=17, head_scale=0.5)
+    ids = region_score(*inputs, max_region_len=65, top_k=17, head_scale=0.5)
     torch.testing.assert_close(ids.cpu(), expected_ids.cpu(), rtol=0, atol=0)
 
     selected = torch.empty_like(ids)
-    returned = region_score_topk(*inputs, max_region_len=65, top_k=17, head_scale=0.5, selected_region_ids=selected)
+    returned = region_score(*inputs, max_region_len=65, top_k=17, head_scale=0.5, selected_region_ids=selected)
     assert returned.data_ptr() == selected.data_ptr()
     torch.testing.assert_close(returned.cpu(), expected_ids.cpu(), rtol=0, atol=0)
 
 
-def test_topk_only_meta_default_and_out_shapes(region_score_topk):
+def test_topk_only_meta_default_and_out_shapes(region_score):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode():
@@ -196,11 +194,11 @@ def test_topk_only_meta_default_and_out_shapes(region_score_topk):
         lengths = torch.empty((1,), dtype=torch.int32)
         table = torch.empty((1, 8), dtype=torch.int32)
         cu = torch.empty((2,), dtype=torch.int32)
-        ids = region_score_topk(query, weights, key, lengths, table, cu, max_region_len=65, top_k=17)
+        ids = region_score(query, weights, key, lengths, table, cu, max_region_len=65, top_k=17)
         assert ids.shape == (4, 9, 17)
         assert ids.dtype == torch.int32
         selected = torch.empty((4, 9, 17), dtype=torch.int32)
-        returned = region_score_topk(
+        returned = region_score(
             query,
             weights,
             key,
@@ -212,25 +210,180 @@ def test_topk_only_meta_default_and_out_shapes(region_score_topk):
             selected_region_ids=selected,
         )
         assert returned is selected
+        score = torch.empty((4, 9, 65), dtype=torch.float32)
+        returned = region_score(
+            query,
+            weights,
+            key,
+            lengths,
+            table,
+            cu,
+            max_region_len=65,
+            top_k=17,
+            out=score,
+            selected_region_ids=selected,
+        )
+        assert returned[0] is score and returned[1] is selected
+        operator = torch.ops._C_ascend.npu_indexer_region_score
+        allocated_score, allocated_ids = operator.score(query, weights, key, lengths, table, cu, 65, 17)
+        assert allocated_score.shape == (4, 9, 65) and allocated_score.dtype == torch.float32
+        assert allocated_ids.shape == (4, 9, 17) and allocated_ids.dtype == torch.int32
+        assert (
+            operator.out(query, weights, key, lengths, table, cu, 65, 17, out=score, selected_region_ids=selected)
+            is None
+        )
 
 
-def test_topk_only_rejects_unsupported_layouts(region_score_topk):
-    query = torch.empty((4, 1, 4, 512), dtype=torch.bfloat16, device="npu")[..., ::2]
-    weights = torch.zeros((4, 1, 4), dtype=torch.float32, device="npu")
-    key = torch.zeros((9, 8, 1, HEAD_DIM), dtype=torch.bfloat16, device="npu")
-    lengths = torch.tensor((80,), dtype=torch.int32, device="npu")
-    table = torch.arange(9, dtype=torch.int32, device="npu").view(1, 9)
-    cu = torch.tensor((0, 4), dtype=torch.int32, device="npu")
-    args = (query, weights, key, lengths, table, cu)
-    with pytest.raises(RuntimeError, match="contiguous|TopK-only"):
-        region_score_topk(*args, max_region_len=65, top_k=17)
+def test_single_dispatcher_overloads_return_types_and_mutations(region_score):
+    query, weights, backing, lengths, table, cu = make_inputs(
+        torch.bfloat16, torch.float32, (3,), 65, 16, (65,), groups=4, heads=12
+    )
+    expected_scores, expected_ids, visible = reference(query, weights, backing, lengths, table, cu, 65, 17)
+    inputs = tuple(tensor.npu() for tensor in (query, weights, backing[:, 1], lengths, table, cu))
+    args = (*inputs, 65, 17, REGION_SIZE, 0.5, 1, 3, 1)
+    operator = torch.ops._C_ascend.npu_indexer_region_score
+    assert set(operator.overloads()) == {"default", "score", "ids_out", "out"}
+    assert not hasattr(torch.ops._C_ascend, "npu_indexer_region_score_topk")
+    ids = operator.default(*args)
+    torch.testing.assert_close(ids.cpu(), expected_ids, rtol=0, atol=0)
+    ids.fill_(SENTINEL)
+    assert operator.ids_out(*args, selected_region_ids=ids) is None
+    torch.testing.assert_close(ids.cpu(), expected_ids, rtol=0, atol=0)
+    scores, allocated_ids = operator.score(*args)
+    torch.testing.assert_close(allocated_ids.cpu(), expected_ids, rtol=0, atol=0)
+    scores.fill_(SENTINEL)
+    ids.fill_(SENTINEL)
+    assert operator.out(*args, out=scores, selected_region_ids=ids) is None
+    torch.testing.assert_close(ids.cpu(), expected_ids, rtol=0, atol=0)
+    for token, count in enumerate(visible.tolist()):
+        torch.testing.assert_close(scores[:, token, :count].cpu(), expected_scores[:, token, :count], rtol=0, atol=0)
 
-    query = query.contiguous()
-    ids_storage = torch.empty(4 * 17 + 1, dtype=torch.int32, device="npu")
-    unaligned_ids = ids_storage[1:].view(1, 4, 17)
-    assert unaligned_ids.is_contiguous() and unaligned_ids.storage_offset() % 8 != 0
-    with pytest.raises(RuntimeError, match="aligned|TopK-only"):
-        region_score_topk(query, *args[1:], max_region_len=65, top_k=17, selected_region_ids=unaligned_ids)
+
+@pytest.mark.parametrize("mode", ("ids", "ids_out", "out"))
+@pytest.mark.parametrize("transform", ("aot_eager", "functionalize"))
+@pytest.mark.parametrize("layout", ("dense", "outer-views"))
+def test_single_interface_functionalization(region_score, mode, transform, layout):
+    query, weights, backing, lengths, table, cu = make_inputs(
+        torch.bfloat16, torch.float32, (3,), 65, 16, (65,), groups=4, heads=12
+    )
+    expected_scores, expected_ids, visible = reference(query, weights, backing, lengths, table, cu, 65, 17)
+    cpu_inputs = (query, weights, backing[:, 1], lengths, table, cu)
+    inputs = tuple(device_input_view(tensor) if layout == "outer-views" else tensor.npu() for tensor in cpu_inputs)
+    if layout == "outer-views":
+        score_out, score_storage, score_untouched = guarded_output_view((4, 3, 65), torch.float32, inputs[0].device)
+        ids_out, ids_storage, ids_untouched = guarded_output_view((4, 3, 17), torch.int32, inputs[0].device)
+    else:
+        score_out = torch.empty((4, 3, 65), dtype=torch.float32, device=inputs[0].device)
+        ids_out = torch.empty((4, 3, 17), dtype=torch.int32, device=inputs[0].device)
+
+    def execute(query, weights, key, lengths, table, cu, score_out, ids_out):
+        kwargs = dict(max_region_len=65, top_k=17, head_scale=0.5)
+        if mode != "ids":
+            kwargs["selected_region_ids"] = ids_out
+        if mode == "out":
+            kwargs["out"] = score_out
+        return region_score(query, weights, key, lengths, table, cu, **kwargs)
+
+    transformed = (
+        torch.compile(execute, backend="aot_eager", fullgraph=True)
+        if transform == "aot_eager"
+        else torch.func.functionalize(execute)
+    )
+    result = transformed(*inputs, score_out, ids_out)
+    actual_ids = result[1] if mode == "out" else result
+    torch.testing.assert_close(actual_ids.cpu(), expected_ids, rtol=0, atol=0)
+    if mode != "ids":
+        torch.testing.assert_close(ids_out.cpu(), expected_ids, rtol=0, atol=0)
+        if transform == "aot_eager":
+            assert actual_ids.data_ptr() == ids_out.data_ptr()
+    if mode == "out":
+        if transform == "aot_eager":
+            assert result[0].data_ptr() == score_out.data_ptr()
+        for token, count in enumerate(visible.tolist()):
+            for scores in (result[0], score_out):
+                torch.testing.assert_close(
+                    scores[:, token, :count].cpu(), expected_scores[:, token, :count], rtol=0, atol=0
+                )
+    if layout == "outer-views":
+        assert torch.all(score_storage.cpu()[score_untouched] == SENTINEL)
+        assert torch.all(ids_storage.cpu()[ids_untouched] == SENTINEL)
+
+
+@pytest.mark.parametrize("layout", ("extra-capacity", "strided"))
+@pytest.mark.parametrize("transform", ("eager", "aot_eager", "functionalize"))
+def test_score_output_views_in_all_execution_modes(region_score, layout, transform):
+    query, weights, backing, lengths, table, cu = make_inputs(
+        torch.bfloat16, torch.float32, (3,), 65, 16, (65,), groups=4, heads=12
+    )
+    expected_scores, expected_ids, visible = reference(query, weights, backing, lengths, table, cu, 65, 17)
+    inputs = tuple(tensor.npu() for tensor in (query, weights, backing[:, 1], lengths, table, cu))
+    capacity = 74
+    if layout == "strided":
+        score_out, score_storage, untouched = guarded_output_view((4, 3, capacity), torch.float32, inputs[0].device)
+    else:
+        score_storage = torch.full((4, 3, capacity), SENTINEL, dtype=torch.float32, device=inputs[0].device)
+        score_out, untouched = score_storage, None
+    ids_out, ids_storage, ids_untouched = guarded_output_view((4, 3, 17), torch.int32, inputs[0].device)
+
+    def execute(query, weights, key, lengths, table, cu, score_out, ids_out):
+        return region_score(
+            query,
+            weights,
+            key,
+            lengths,
+            table,
+            cu,
+            max_region_len=65,
+            top_k=17,
+            head_scale=0.5,
+            out=score_out,
+            selected_region_ids=ids_out,
+        )
+
+    transformed = (
+        torch.compile(execute, backend="aot_eager", fullgraph=True)
+        if transform == "aot_eager"
+        else torch.func.functionalize(execute)
+        if transform == "functionalize"
+        else execute
+    )
+    returned_score, returned_ids = transformed(*inputs, score_out, ids_out)
+    torch.testing.assert_close(returned_ids.cpu(), expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(ids_out.cpu(), expected_ids, rtol=0, atol=0)
+    if transform != "functionalize":
+        assert returned_score.data_ptr() == score_out.data_ptr()
+        assert returned_ids.data_ptr() == ids_out.data_ptr()
+    for token, count in enumerate(visible.tolist()):
+        for score in (returned_score, score_out):
+            torch.testing.assert_close(score[:, token, :count].cpu(), expected_scores[:, token, :count], rtol=0, atol=0)
+    if untouched is not None:
+        assert torch.all(score_storage.cpu()[untouched] == SENTINEL)
+    assert torch.all(ids_storage.cpu()[ids_untouched] == SENTINEL)
+    if transform != "eager":
+        # Functional output is R-wide and copies only this prefix into caller capacity.
+        assert torch.all(score_out[..., 65:].cpu() == SENTINEL)
+
+
+@pytest.mark.parametrize("dtype", QK_DTYPES)
+@pytest.mark.parametrize(
+    "input_layout",
+    (
+        "query",
+        "query-offset",
+        "weights",
+        "weights-offset",
+        "lengths",
+        "table",
+        "cu",
+        "all",
+        "interleaved",
+        "key-transpose",
+        "key-page-stride",
+        "key-offset",
+    ),
+)
+def test_ids_only_materializes_input_and_output_views(region_score, dtype, input_layout):
+    check_layout_case(region_score, dtype, input_layout=input_layout, output_layout="ids", ids_only=True)
 
 
 @pytest.mark.parametrize("dtype", QK_DTYPES)
@@ -238,7 +391,7 @@ def test_topk_only_rejects_unsupported_layouts(region_score_topk):
     "tokens,groups,regions,heads,top_k",
     ((2049, 1, 32769, 4, 512), (1901, 4, 9000, 12, 37), (3777, 1, 32769, 4, 512)),
 )
-def test_topk_only_forces_bounded_workspace_batch(region_score_topk, dtype, tokens, groups, regions, heads, top_k):
+def test_topk_only_forces_bounded_workspace_batch(region_score, dtype, tokens, groups, regions, heads, top_k):
     dim = HEAD_DIM
     page_size = 8
     pages = (regions + page_size - 1) // page_size
@@ -254,12 +407,13 @@ def test_topk_only_forces_bounded_workspace_batch(region_score_topk, dtype, toke
         device="npu",
     )
     dense_score_bytes = groups * tokens * regions * torch.empty((), dtype=torch.float32).element_size()
+    # These inputs are aligned/dense; no extra outer materialization is needed.
     budget_bytes = 256 * 1024**2
     assert dense_score_bytes > budget_bytes
 
     start_allocated = torch.npu.memory_allocated()
     torch.npu.reset_peak_memory_stats()
-    ids = region_score_topk(query, weights, key, lengths, table, cu, max_region_len=regions, top_k=top_k)
+    ids = region_score(query, weights, key, lengths, table, cu, max_region_len=regions, top_k=top_k)
     torch.npu.synchronize()
     expected = (
         torch.arange(top_k, dtype=torch.int32, device="cpu").view(1, 1, top_k).expand(groups, tokens, top_k).clone()
@@ -440,6 +594,115 @@ def test_invalid_groups_or_heads(region_score, groups, heads):
         region_score(*inputs, max_region_len=16, top_k=3)
 
 
+@pytest.mark.parametrize("dtype", QK_DTYPES)
+@pytest.mark.parametrize("score_output", (False, True))
+@pytest.mark.parametrize("input_index", (0, 2))
+@pytest.mark.parametrize("aligned", (False, True))
+def test_dense_offset_views_with_large_backing(region_score, dtype, score_output, input_index, aligned):
+    query, weights, backing, lengths, table, cu = make_inputs(
+        dtype, torch.float32, (3,), 65, 16, (65,), groups=4, heads=12
+    )
+    expected_scores, expected_ids, visible = reference(query, weights, backing, lengths, table, cu, 65, 17)
+    cpu_inputs = (query, weights, backing[:, 1], lengths, table, cu)
+    inputs = [tensor.npu() for tensor in cpu_inputs]
+    tensor = cpu_inputs[input_index]
+    alignment_elements = 32 // tensor.element_size()
+    offset = tensor.numel() + (alignment_elements if aligned else 1)
+    storage = torch.full((offset + tensor.numel() + 257,), 31.0).to(dtype)
+    storage[offset : offset + tensor.numel()].view(tensor.shape).copy_(tensor)
+    inputs[input_index] = storage.npu()[offset : offset + tensor.numel()].view(tensor.shape)
+    assert inputs[input_index].is_contiguous() and inputs[input_index].storage_offset() > tensor.numel()
+    assert (inputs[input_index].storage_offset() * tensor.element_size() % 32 == 0) == aligned
+    count = expected_ids.numel()
+    ids_storage = torch.full((2 * count + 258,), SENTINEL, dtype=torch.int32, device=inputs[0].device)
+    ids = ids_storage[count + 1 : 2 * count + 1].view(expected_ids.shape)
+    kwargs = dict(max_region_len=65, top_k=17, head_scale=0.5, selected_region_ids=ids)
+    if score_output:
+        kwargs["out"] = torch.empty((4, 3, 65), dtype=torch.float32, device=inputs[0].device)
+    result = region_score(*inputs, **kwargs)
+    actual_ids = result[1] if score_output else result
+    assert actual_ids.data_ptr() == ids.data_ptr()
+    torch.testing.assert_close(actual_ids.cpu(), expected_ids, rtol=0, atol=0)
+    assert torch.all(ids_storage[: count + 1].cpu() == SENTINEL)
+    assert torch.all(ids_storage[2 * count + 1 :].cpu() == SENTINEL)
+    if score_output:
+        for token, count_visible in enumerate(visible.tolist()):
+            torch.testing.assert_close(
+                result[0][:, token, :count_visible].cpu(), expected_scores[:, token, :count_visible], rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize("dtype", QK_DTYPES)
+@pytest.mark.parametrize("score_output", (False, True))
+def test_dense_aligned_metadata_offsets_retain_original_capacity(region_score, dtype, score_output):
+    query, weights, backing, lengths, table, cu = make_inputs(
+        dtype, torch.float32, (3,), 65, 16, (65,), groups=4, heads=12
+    )
+    expected_scores, expected_ids, visible = reference(query, weights, backing, lengths, table, cu, 65, 17)
+    inputs = [query.npu(), weights.npu(), backing.npu()[:, 1], lengths.npu(), table.npu(), cu.npu()]
+    # Metadata can have a logical one-element shape but an aligned offset of eight.
+    # The original backing capacity must survive a Contiguous-created alias view.
+    for index, tensor in ((0, query), (1, weights), (3, lengths), (4, table), (5, cu)):
+        offset = 1 if index == 0 else 32 // tensor.element_size()
+        storage = torch.full((offset + tensor.numel() + 257,), 31.0).to(tensor.dtype)
+        storage[offset : offset + tensor.numel()].view(tensor.shape).copy_(tensor)
+        inputs[index] = storage.npu()[offset : offset + tensor.numel()].view(tensor.shape)
+        assert inputs[index].is_contiguous() and inputs[index].storage_offset() == offset
+    kwargs = dict(max_region_len=65, top_k=17, head_scale=0.5)
+    if score_output:
+        kwargs["out"] = torch.empty((4, 3, 65), dtype=torch.float32, device=inputs[0].device)
+    result = region_score(*inputs, **kwargs)
+    actual_ids = result[1] if score_output else result
+    torch.testing.assert_close(actual_ids.cpu(), expected_ids, rtol=0, atol=0)
+    if score_output:
+        for token, count in enumerate(visible.tolist()):
+            torch.testing.assert_close(
+                result[0][:, token, :count].cpu(), expected_scores[:, token, :count], rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize("invalid", ("score-dtype", "score-capacity", "ids-dtype", "ids-shape", "input-device"))
+@pytest.mark.parametrize("transform", ("eager", "aot_eager", "functionalize"))
+def test_invalid_buffers_still_rejected_after_layout_normalization(region_score, invalid, transform):
+    query, weights, backing, lengths, table, cu = make_inputs(
+        torch.bfloat16, torch.float32, (3,), 65, 16, (65,), groups=4, heads=12
+    )
+    inputs = [tensor.npu() for tensor in (query, weights, backing[:, 1], lengths, table, cu)]
+    score = torch.empty((4, 3, 64 if invalid == "score-capacity" else 74), device=inputs[0].device)
+    ids = torch.empty((4, 3, 18 if invalid == "ids-shape" else 17), dtype=torch.int32, device=inputs[0].device)
+    if invalid == "score-dtype":
+        score = score.to(torch.bfloat16)
+    if invalid == "ids-dtype":
+        ids = ids.float()
+    if invalid == "input-device":
+        inputs[1] = inputs[1].cpu()
+
+    def execute(query, weights, key, lengths, table, cu, score, ids):
+        return region_score(
+            query,
+            weights,
+            key,
+            lengths,
+            table,
+            cu,
+            max_region_len=65,
+            top_k=17,
+            head_scale=0.5,
+            out=score,
+            selected_region_ids=ids,
+        )
+
+    transformed = (
+        torch.compile(execute, backend="aot_eager", fullgraph=True)
+        if transform == "aot_eager"
+        else torch.func.functionalize(execute)
+        if transform == "functionalize"
+        else execute
+    )
+    with pytest.raises((RuntimeError, ValueError)):
+        transformed(*inputs, score, ids)
+
+
 def device_input_view(tensor, layout="interleaved"):
     if layout == "key-transpose":
         return tensor.transpose(1, 3).contiguous().npu().transpose(1, 3)
@@ -478,8 +741,9 @@ def check_layout_case(
     input_layout=None,
     output_layout=None,
     regions=137,
-    default_outputs=False,
+    allocate_ids=False,
     single_key_page=False,
+    ids_only=False,
 ):
     groups, heads, top_k = 4, 20, 3
     query, weights, backing, lengths, table, cu = make_inputs(
@@ -513,31 +777,43 @@ def check_layout_case(
             assert not inputs[2].is_contiguous()
     kwargs = dict(max_region_len=regions, top_k=top_k, head_scale=0.5, cache_mode=1, mask_mode=3, sort_mode=1)
     guards = []
-    if not default_outputs:
-        outputs = []
+    if not allocate_ids:
+        outputs = {}
         for name, shape, output_dtype in (
             ("scores", (groups, query.shape[0], regions + 9), torch.float32),
             ("ids", (groups, query.shape[0], top_k), torch.int32),
         ):
+            if ids_only and name == "scores":
+                continue
             if output_layout in (name, "both"):
                 view, storage, untouched = guarded_output_view(shape, output_dtype, inputs[0].device)
                 assert not view.is_contiguous()
                 guards.append((storage, untouched))
             else:
                 view = torch.full(shape, SENTINEL, dtype=output_dtype, device=inputs[0].device)
-            outputs.append(view)
-        kwargs.update(out=outputs[0], selected_region_ids=outputs[1])
-    actual_scores, actual_ids = region_score(*inputs, **kwargs)
-    if not default_outputs:
-        assert actual_scores.data_ptr() == outputs[0].data_ptr()
-        assert actual_ids.data_ptr() == outputs[1].data_ptr()
-    assert actual_scores.shape == (groups, query.shape[0], regions if default_outputs else regions + 9)
+            outputs[name] = view
+        kwargs["selected_region_ids"] = outputs["ids"]
+        if not ids_only:
+            kwargs["out"] = outputs["scores"]
+    else:
+        # The unified interface requires explicit Score storage; IDs may be allocated.
+        if not ids_only:
+            kwargs["out"] = torch.empty((groups, query.shape[0], regions), dtype=torch.float32, device=inputs[0].device)
+    result = region_score(*inputs, **kwargs)
+    actual_scores, actual_ids = (None, result) if ids_only else result
+    if not allocate_ids:
+        if not ids_only:
+            assert actual_scores.data_ptr() == outputs["scores"].data_ptr()
+        assert actual_ids.data_ptr() == outputs["ids"].data_ptr()
     assert actual_ids.shape == expected_ids.shape
-    actual_scores, actual_ids = actual_scores.cpu(), actual_ids.cpu()
-    for token, visible in enumerate(visible_counts.tolist()):
-        torch.testing.assert_close(
-            actual_scores[:, token, :visible], expected_scores[:, token, :visible], rtol=0, atol=0
-        )
+    actual_ids = actual_ids.cpu()
+    if not ids_only:
+        assert actual_scores.shape == (groups, query.shape[0], regions if allocate_ids else regions + 9)
+        actual_scores = actual_scores.cpu()
+        for token, visible in enumerate(visible_counts.tolist()):
+            torch.testing.assert_close(
+                actual_scores[:, token, :visible], expected_scores[:, token, :visible], rtol=0, atol=0
+            )
     torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
     for storage, untouched in guards:
         assert torch.all(storage.cpu()[untouched] == SENTINEL)
@@ -564,6 +840,11 @@ def test_noncontiguous_input_views(region_score, dtype, input_layout):
 
 
 @pytest.mark.parametrize("dtype", QK_DTYPES)
+def test_ids_only_views_with_allocated_output(region_score, dtype):
+    check_layout_case(region_score, dtype, input_layout="all", allocate_ids=True, ids_only=True)
+
+
+@pytest.mark.parametrize("dtype", QK_DTYPES)
 @pytest.mark.parametrize("output_layout", ("scores", "ids", "both"))
 @pytest.mark.parametrize("regions", (0, 137))
 def test_noncontiguous_output_views(region_score, dtype, output_layout, regions):
@@ -571,14 +852,14 @@ def test_noncontiguous_output_views(region_score, dtype, output_layout, regions)
 
 
 @pytest.mark.parametrize("dtype", QK_DTYPES)
-@pytest.mark.parametrize("default_outputs", (False, True))
-def test_mixed_noncontiguous_views(region_score, dtype, default_outputs):
-    check_layout_case(region_score, dtype, input_layout="all", output_layout="both", default_outputs=default_outputs)
+@pytest.mark.parametrize("allocate_ids", (False, True))
+def test_mixed_noncontiguous_views(region_score, dtype, allocate_ids):
+    check_layout_case(region_score, dtype, input_layout="all", output_layout="both", allocate_ids=allocate_ids)
 
 
 @pytest.mark.parametrize("dtype", QK_DTYPES)
-def test_noncontiguous_inputs_with_default_empty_scores(region_score, dtype):
-    check_layout_case(region_score, dtype, input_layout="all", regions=0, default_outputs=True)
+def test_noncontiguous_inputs_with_allocated_empty_scores(region_score, dtype):
+    check_layout_case(region_score, dtype, input_layout="all", regions=0, allocate_ids=True)
 
 
 @pytest.mark.parametrize("dtype", QK_DTYPES)

@@ -3031,28 +3031,21 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_fused_quant_lightning_indexer_manage", torch::kPrivateUse1,
              &vllm_ascend::npu_fused_quant_lightning_indexer_manage);
 
-    ops.def(
-        "npu_indexer_region_score(Tensor query, Tensor weights, Tensor key_summary, "
+    const std::string regionScoreInputs =
+        "Tensor query, Tensor weights, Tensor key_summary, "
         "Tensor actual_kv_lengths, Tensor block_table, Tensor cu_seq_lens, "
         "int max_region_len, int top_k=512, int region_size=8, float head_scale=1.0, "
-        "int cache_mode=1, int mask_mode=3, int sort_mode=1, "
-        "Tensor(a!)? out=None, Tensor(b!)? selected_region_ids=None) -> (Tensor(a), Tensor(b))"
-    );
-    ops.impl("npu_indexer_region_score", torch::kPrivateUse1, &vllm_ascend::npu_indexer_region_score<true>);
-    ops.def(
-        "npu_indexer_region_score_topk(Tensor query, Tensor weights, Tensor key_summary, "
-        "Tensor actual_kv_lengths, Tensor block_table, Tensor cu_seq_lens, "
-        "int max_region_len, int top_k=512, int region_size=8, float head_scale=1.0, "
-        "int cache_mode=1, int mask_mode=3, int sort_mode=1) -> Tensor"
-    );
-    ops.def(
-        "npu_indexer_region_score_topk.out(Tensor query, Tensor weights, Tensor key_summary, "
-        "Tensor actual_kv_lengths, Tensor block_table, Tensor cu_seq_lens, "
-        "int max_region_len, int top_k=512, int region_size=8, float head_scale=1.0, "
-        "int cache_mode=1, int mask_mode=3, int sort_mode=1, *, Tensor(a!) selected_region_ids) -> Tensor(a!)"
-    );
-    ops.impl("npu_indexer_region_score_topk", torch::kPrivateUse1, &vllm_ascend::npu_indexer_region_score_topk);
-    ops.impl("npu_indexer_region_score_topk.out", torch::kPrivateUse1, &vllm_ascend::npu_indexer_region_score_topk_out);
+        "int cache_mode=1, int mask_mode=3, int sort_mode=1";
+    ops.def(("npu_indexer_region_score(" + regionScoreInputs + ") -> Tensor").c_str());
+    ops.def(("npu_indexer_region_score.score(" + regionScoreInputs + ") -> (Tensor, Tensor)").c_str());
+    ops.def(("npu_indexer_region_score.ids_out(" + regionScoreInputs +
+        ", *, Tensor(a!) selected_region_ids) -> ()").c_str());
+    ops.def(("npu_indexer_region_score.out(" + regionScoreInputs +
+        ", *, Tensor(a!) out, Tensor(b!) selected_region_ids) -> ()").c_str());
+    ops.impl("npu_indexer_region_score", torch::kPrivateUse1, &vllm_ascend::npu_indexer_region_score<false>);
+    ops.impl("npu_indexer_region_score.score", torch::kPrivateUse1, &vllm_ascend::npu_indexer_region_score<true>);
+    ops.impl("npu_indexer_region_score.ids_out", torch::kPrivateUse1, &vllm_ascend::npu_indexer_region_score_ids_out);
+    ops.impl("npu_indexer_region_score.out", torch::kPrivateUse1, &vllm_ascend::npu_indexer_region_score_out);
 
     // k2q_csr: q2k -> k2q CSR (Meta/Hist/RowPrefix/TilePrefix/Scatter)
     ops.def(

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 namespace IndexerRegionScoreHost {
+// Bounds the IRS layout; outer Contiguous/ViewCopy allocations are separate.
 constexpr uint64_t kTopKOnlyWorkspaceBudgetBytes = 256ULL * 1024ULL * 1024ULL;
 constexpr uint64_t kBoundedExecutorReserve = 4096U;
 struct BoundedWorkspacePlan {

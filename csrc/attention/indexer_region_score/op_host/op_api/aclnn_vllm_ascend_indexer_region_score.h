@@ -14,12 +14,4 @@ ACLNN_API aclnnStatus aclnnVllmAscendIndexerRegionScoreGetWorkspaceSize(
     uint64_t *workspaceSize, aclOpExecutor **executor);
 ACLNN_API aclnnStatus aclnnVllmAscendIndexerRegionScore(
     void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
-ACLNN_API aclnnStatus aclnnVllmAscendIndexerRegionScoreTopKGetWorkspaceSize(
-    const aclTensor *query, const aclTensor *weights, const aclTensor *keySummary,
-    const aclTensor *actualKvLengths, const aclTensor *blockTable, const aclTensor *cuSeqLens,
-    int64_t maxRegionLen, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode,
-    const aclTensor *selectedRegionIds, uint64_t *workspaceSize, aclOpExecutor **executor);
-ACLNN_API aclnnStatus aclnnVllmAscendIndexerRegionScoreTopK(
-    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream);
 }

@@ -9,9 +9,11 @@ and heads per group `H` can be any multiple of 4 from 4 through 128.
 Key summaries are shared by all query groups.
 
 ```python
+import torch
+
 from vllm_ascend.ops.indexer_region_score import indexer_region_score
 
-scores, region_ids = indexer_region_score(
+region_ids = indexer_region_score(
     query,                    # [T, G, H, 256]
     weights,                  # [T, G, H]
     key_summary,             # [P, S, 1, 256]
@@ -27,56 +29,71 @@ scores, region_ids = indexer_region_score(
 )
 ```
 
-`scores` is FP32 `[G, T, R_out]`, with `R_out=max_region_len` by default;
-a preallocated output may have larger capacity. `region_ids` is INT32
+Omitting `out`, or passing `out=None`, returns only IDs and does not allocate
+a dense score output. `region_ids` is INT32
 `[G, T, top_k]` and contains logical region IDs in ascending order. IDs are
 selected by descending score, with the smaller logical ID winning ties.
 Unused slots contain `-1`. These IDs do not include physical page mapping,
 the current region, or downstream packing.
 `top_k` is in `[1, 512]`. Selection assumes finite FP32 scores.
 
-The API accepts noncontiguous inputs and output views. ACLNN converts inputs
-as needed and copies results back into the caller's output views. Aligned
-paged cache views with contiguous page contents, gaps between pages, and
-nonzero layer offsets retain zero-copy access; other key layouts are
-materialized. Optional `out` and `selected_region_ids` buffers are reused.
-Output views must not overlap internally, with inputs, or with each other.
-
-To omit the public score tensor, use the separate IDs-only API:
+To also produce FP32 scores, supply an output buffer to the same API:
 
 ```python
-from vllm_ascend.ops.indexer_region_score import indexer_region_score_topk
-
-region_ids = indexer_region_score_topk(
+score_buffer = query.new_empty(
+    (query.shape[1], query.shape[0], 8192), dtype=torch.float32,
+)
+scores, region_ids = indexer_region_score(
     query, weights, key_summary, actual_kv_lengths, block_table, cu_seq_lens,
-    max_region_len=8192, top_k=512,
-    # selected_region_ids=preallocated_ids,  # optional [G,T,top_k] INT32 buffer
+    max_region_len=8192, top_k=512, out=score_buffer,
 )
 ```
 
-Its scoring, causal visibility, tie breaking, ID ordering and padding match the
-complete-score API. Omitting `out` from `indexer_region_score` still allocates
-and returns scores; it does not select IDs-only execution.
+Here `scores` is the supplied FP32 `[G,T,R_out]` buffer, with
+`R_out >= max_region_len`. An optional INT32 `selected_region_ids` buffer
+is reused in either mode. The wrapper returns the caller's output buffers.
 
-IDs-only execution uses an internal, fixed **256 MiB total ACLNN workspace
-limit**, including the CANN library prefix and allocation reserve. It computes
+The dispatcher has one name, `_C_ascend.npu_indexer_region_score`, with
+fixed-return overloads for graph capture: the default returns IDs, `.score`
+returns newly allocated `(scores, ids)`, and `.ids_out`/`.out` write supplied
+buffers and return nothing. The Python wrapper returns those supplied buffers.
+Score `out` accepts `R_out >= R` and noncontiguous views in eager,
+compiled and functionalized execution. The graph paths copy the R-wide
+functional score prefix into the caller's output capacity.
+
+Both modes accept noncontiguous or unaligned inputs and output views.
+ACLNN converts inputs as needed and copies results back into the caller's
+output views. Aligned
+paged cache views with contiguous page contents, gaps between pages, and
+nonzero layer offsets retain zero-copy access; other key layouts are
+materialized.
+Output views must not overlap internally, with inputs, or with each other.
+
+Both modes use the same scoring, causal visibility, tie breaking, ID ordering
+and padding. This matches the source bf16 interface selected by `out`.
+
+IDs-only execution uses a fixed **256 MiB IRS algorithm workspace limit**,
+including its CANN library prefix, intrinsic auxiliary storage and alignment
+reserve. It computes
 into a `[G,batch_T,roundup8(R)]` FP32 pool, selects IDs, and reuses the pool for
 the next token batch. Request positions remain global across batches. If even
 one token batch cannot fit, the call fails. Input storage and final IDs are
-outside this workspace limit; it is not a whole-model memory limit.
+outside this algorithm limit. Outer input materialization and output-view
+writeback storage are additional allocations. ACLNN `GetWorkspaceSize` returns
+the full executor requirement, which may therefore exceed 256 MiB; callers
+must allocate that returned size. This is not a whole-model memory limit.
 
-Following the original bf16 TopK-only implementation, Query, weights, request
-metadata and the optional IDs buffer must be contiguous. Key supports aligned,
-page-inner-contiguous views, including inter-page gaps and layer offsets. The
-IDs buffer's storage base and view offset must be 32-byte aligned. Unsupported
-layouts are rejected without materializing full input copies. These stricter
-requirements apply to IDs-only execution; the complete-score interface keeps
-its noncontiguous input/output support.
+Compatible aligned page-inner-contiguous Key views, including inter-page
+gaps and layer offsets, retain direct reads. Other layouts are materialized.
+Unaligned or strided outputs use aligned temporary storage followed by
+writeback to the caller view. Alignment copies read only the logical dense
+span, even when the backing storage is much larger or the offset exceeds
+the view's element count. Scoring and selection still use the bounded pool;
+IDs-only execution does not allocate a dense score output.
 
 At the native layer, passing `output=nullptr` to
 `aclnnVllmAscendIndexerRegionScoreGetWorkspaceSize` selects the same bounded
-path. `aclnnVllmAscendIndexerRegionScoreTopKGetWorkspaceSize` and
-`aclnnVllmAscendIndexerRegionScoreTopK` provide convenience entry points.
+path. Both modes use this single native entry point.
 The internal GE score slot has shape `[0]` when disabled. No public workspace
 budget parameter is added. The migrated scope remains D=256, K<=512 and
 cache/mask/sort modes 1/3/1.

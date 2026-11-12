@@ -7,7 +7,7 @@
 #include <tuple>
 namespace vllm_ascend {
 template<bool RETURN_SCORE = true>
-inline std::tuple<at::Tensor, at::Tensor> npu_indexer_region_score(
+inline std::tuple<at::Tensor, at::Tensor> IndexerRegionScore(
     const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
     const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
     int64_t regions, int64_t topK, int64_t regionSize, double headScale,
@@ -63,45 +63,40 @@ inline std::tuple<at::Tensor, at::Tensor> npu_indexer_region_score(
         for (const auto *input : inputs) at::assert_no_overlap(*output, *input);
     }
     if (RETURN_SCORE) at::assert_no_overlap(scores, ids);
-    if (!RETURN_SCORE) {
-        const at::Tensor *contiguous[] = {&query, &weights, &lengths, &table, &cu, &ids};
-        for (const auto *tensor : contiguous) {
-            TORCH_CHECK(tensor->is_contiguous(), "TopK-only requires contiguous Q/weights/metadata/IDs");
-        }
-        constexpr int64_t ALIGNMENT = 32;
-        TORCH_CHECK(key.stride(3) == 1 && (key.size(1) == 1 || key.stride(1) == DIM) &&
-            key.stride(0) >= key.size(1) * DIM && key.stride(0) * key.element_size() % ALIGNMENT == 0 &&
-            key.storage_offset() * key.element_size() % ALIGNMENT == 0,
-            "TopK-only Key requires aligned page-inner-contiguous storage");
-        TORCH_CHECK(ids.storage_offset() % 8 == 0 && reinterpret_cast<uintptr_t>(ids.data_ptr()) % ALIGNMENT == 0,
-            "TopK-only selected_region_ids requires a 32-byte aligned storage base and view offset");
-    }
     const c10_npu::OptionalNPUGuard deviceGuard(query.device());
-    if (RETURN_SCORE) {
-        EXEC_NPU_CMD(aclnnVllmAscendIndexerRegionScore, query, weights, key, lengths, table, cu,
-            regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, scores, ids);
-    } else {
-        EXEC_NPU_CMD(aclnnVllmAscendIndexerRegionScoreTopK, query, weights, key, lengths, table, cu,
-            regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, ids);
-    }
+    const c10::optional<at::Tensor> scoreOutput = RETURN_SCORE ? c10::optional<at::Tensor>(scores) : c10::nullopt;
+    EXEC_NPU_CMD(aclnnVllmAscendIndexerRegionScore, query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, scoreOutput, ids);
     return {scores, ids};
 }
-inline at::Tensor npu_indexer_region_score_topk_out(
-    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
-    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
-    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
-{
-    return std::get<1>(npu_indexer_region_score<false>(query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, selectedIds));
-}
-inline at::Tensor npu_indexer_region_score_topk(
+template<bool RETURN_SCORE>
+inline auto npu_indexer_region_score(
     const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
     const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
     int64_t regions, int64_t topK, int64_t regionSize, double headScale,
     int64_t cacheMode, int64_t maskMode, int64_t sortMode)
 {
-    return std::get<1>(npu_indexer_region_score<false>(query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, c10::nullopt));
+    auto result = IndexerRegionScore<RETURN_SCORE>(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, c10::nullopt);
+    if constexpr (RETURN_SCORE) return result;
+    else return std::get<1>(result);
+}
+inline void npu_indexer_region_score_ids_out(
+    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
+    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
+    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
+{
+    (void)IndexerRegionScore<false>(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, selectedIds);
+}
+inline void npu_indexer_region_score_out(
+    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
+    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
+    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &out, const at::Tensor &selectedIds)
+{
+    (void)IndexerRegionScore<true>(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, out, selectedIds);
 }
 } // namespace vllm_ascend

@@ -1,5 +1,10 @@
 # TopK-only validation
 
+This is the historical validation of commit `69ebd50ad`, before the single
+Torch interface was synchronized. Its separate Python/ACLNN TopK convenience
+entry points have since been removed. Current behavior and validation are in
+[unified Torch validation](UNIFIED_TORCH_VALIDATION.md).
+
 Validated on 2026-11-12 with Ascend950PR, CANN 9.2.0, PyTorch 2.10.0 and
 torch_npu 2.10.0.post6. The complete repository Torch extension and all nine
 native Q/K and weight dtype combinations were rebuilt. Validation used a
