@@ -2,6 +2,7 @@
 // Licensed under CANN Open Software License Agreement Version 2.0.
 #include "aclnn_vllm_ascend_indexer_region_score.h"
 #include <cstdint>
+#include "../indexer_region_score_bounded_workspace.h"
 #include "aclnn_kernels/contiguous.h"
 #include "level0/tensor_move.h"
 #include "opdev/make_op_executor.h"
@@ -55,9 +56,12 @@ aclnnStatus VllmAscendIndexerRegionScore(
 {
     L0_DFX(VllmAscendIndexerRegionScore, query, weights, key, lengths, table, cu,
         regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, output, ids);
+    const bool returnScore = output != nullptr;
+    if (!output) output = executor->AllocTensor(Shape{0}, DataType::DT_FLOAT);
+    if (!output) return ACLNN_ERR_INNER_NULLPTR;
     return ADD_TO_LAUNCHER_LIST_AICORE(VllmAscendIndexerRegionScore,
         OP_INPUT(query, weights, key, lengths, table, cu), OP_OUTPUT(output, ids),
-        OP_ATTR(regions, topK, regionSize, static_cast<float>(headScale), cacheMode, maskMode, sortMode));
+        OP_ATTR(regions, topK, regionSize, static_cast<float>(headScale), cacheMode, maskMode, sortMode, returnScore));
 }
 } // namespace l0op
 extern "C" aclnnStatus aclnnVllmAscendIndexerRegionScoreGetWorkspaceSize(
@@ -71,27 +75,48 @@ extern "C" aclnnStatus aclnnVllmAscendIndexerRegionScoreGetWorkspaceSize(
         DFX_IN(query, weights, key, lengths, table, cu, regions, topK, regionSize, headScale,
             cacheMode, maskMode, sortMode), DFX_OUT(output, ids));
     if (!workspaceSize || !executor) return ACLNN_ERR_PARAM_NULLPTR;
+    *workspaceSize = 0;
+    *executor = nullptr;
+    const bool returnScore = output != nullptr;
     if (cacheMode != 1 || maskMode != 3 || sortMode != 1) return ACLNN_ERR_PARAM_INVALID;
-    for (const aclTensor *tensor : {query, weights, key, lengths, table, cu, output, ids}) {
+    for (const aclTensor *tensor : {query, weights, key, lengths, table, cu, ids}) {
         if (!tensor) return ACLNN_ERR_PARAM_NULLPTR;
         if (tensor->GetViewOffset() < 0) return ACLNN_ERR_PARAM_INVALID;
         tensor->SetOriginalShape(tensor->GetViewShape());
     }
+    if (output) output->SetOriginalShape(output->GetViewShape());
+    if (!returnScore) {
+        for (const aclTensor *tensor : {query, weights, lengths, table, cu, ids}) {
+            if (!IsContiguous(tensor)) return ACLNN_ERR_PARAM_INVALID;
+        }
+        if (!IsPagedKeyView(key) || ids->GetViewOffset() % 8 != 0 ||
+            reinterpret_cast<uintptr_t>(ids->GetStorageAddr()) % 32 != 0) return ACLNN_ERR_PARAM_INVALID;
+    } else if (output->GetViewOffset() < 0) {
+        return ACLNN_ERR_PARAM_INVALID;
+    }
     auto exec = CREATE_EXECUTOR();
     if (!exec.get()) return ACLNN_ERR_INNER_CREATE_EXECUTOR;
-    const aclTensor *views[8];
+    const aclTensor *views[8]{};
     const aclTensor *tensors[] = {query, weights, key, lengths, table, cu, output, ids};
     for (uint32_t i = 0; i < 8; ++i) {
-        views[i] = PrepareTensor(tensors[i], i == 2, i == 0 || i == 2, exec.get());
+        if (!tensors[i]) continue;
+        views[i] = returnScore ? PrepareTensor(tensors[i], i == 2, i == 0 || i == 2, exec.get()) :
+            exec->CreateView(tensors[i], tensors[i]->GetViewShape(), tensors[i]->GetStorageShape(),
+                tensors[i]->GetViewStrides(), tensors[i]->GetViewOffset());
         if (!views[i]) return ACLNN_ERR_INNER_NULLPTR;
     }
     auto ret = l0op::VllmAscendIndexerRegionScore(views[0], views[1], views[2], views[3], views[4], views[5],
         regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, views[6], views[7], exec.get());
     if (ret != ACLNN_SUCCESS) return ret;
-    if (!l0op::ViewCopy(views[6], output, exec.get()) || !l0op::ViewCopy(views[7], ids, exec.get())) {
+    if (returnScore && (!l0op::ViewCopy(views[6], output, exec.get()) ||
+        !l0op::ViewCopy(views[7], ids, exec.get()))) {
         return ACLNN_ERR_INNER_NULLPTR;
     }
     *workspaceSize = exec->GetWorkspaceSize();
+    if (!returnScore && *workspaceSize > IndexerRegionScoreHost::kTopKOnlyWorkspaceBudgetBytes) {
+        *workspaceSize = 0;
+        return ACLNN_ERR_PARAM_INVALID;
+    }
     exec.ReleaseTo(executor);
     return ACLNN_SUCCESS;
 }
@@ -100,4 +125,19 @@ extern "C" aclnnStatus aclnnVllmAscendIndexerRegionScore(
 {
     L2_DFX_PHASE_2(aclnnVllmAscendIndexerRegionScore);
     return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+}
+extern "C" aclnnStatus aclnnVllmAscendIndexerRegionScoreTopKGetWorkspaceSize(
+    const aclTensor *query, const aclTensor *weights, const aclTensor *key,
+    const aclTensor *lengths, const aclTensor *table, const aclTensor *cu,
+    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode,
+    const aclTensor *ids, uint64_t *workspaceSize, aclOpExecutor **executor)
+{
+    return aclnnVllmAscendIndexerRegionScoreGetWorkspaceSize(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, nullptr, ids, workspaceSize, executor);
+}
+extern "C" aclnnStatus aclnnVllmAscendIndexerRegionScoreTopK(
+    void *workspace, uint64_t workspaceSize, aclOpExecutor *executor, aclrtStream stream)
+{
+    return aclnnVllmAscendIndexerRegionScore(workspace, workspaceSize, executor, stream);
 }

@@ -1720,6 +1720,7 @@ std::tuple<at::Tensor, at::Tensor> grouped_matmul_situ_quant_list_meta(
     return make_grouped_matmul_situ_quant_meta_output(x, n);
 }
 
+template<bool RETURN_SCORE = true>
 std::tuple<at::Tensor, at::Tensor> npu_indexer_region_score_meta(
     const at::Tensor &query, const at::Tensor &weights, const at::Tensor &keySummary,
     const at::Tensor &actualKvLengths, const at::Tensor &blockTable, const at::Tensor &cuSeqLens,
@@ -1735,11 +1736,45 @@ std::tuple<at::Tensor, at::Tensor> npu_indexer_region_score_meta(
         "query must be [T,G,H,256], G=1 or a positive multiple of 4, H=4..128 in steps of 4");
     TORCH_CHECK(maxRegionLen >= 0 && maxRegionLen <= 16777216 && topK > 0 && topK <= 512 &&
         regionSize > 0, "invalid indexer_region_score attributes");
-    auto scores = out.has_value() ? *out : at::empty_symint(
+    auto scores = !RETURN_SCORE ? at::Tensor{} : out.has_value() ? *out : at::empty_symint(
         {query.sym_size(1), query.sym_size(0), maxRegionLen}, query.options().dtype(at::kFloat));
     auto ids = selectedIds.has_value() ? *selectedIds : at::empty_symint(
         {query.sym_size(1), query.sym_size(0), topK}, query.options().dtype(at::kInt));
+    if (!RETURN_SCORE) {
+        const at::Tensor *contiguous[] = {&query, &weights, &actualKvLengths, &blockTable, &cuSeqLens, &ids};
+        for (const auto *tensor : contiguous) {
+            TORCH_CHECK(tensor->is_contiguous() && tensor->device() == query.device(),
+                "TopK-only requires contiguous Q/weights/metadata/IDs on the query device");
+        }
+        TORCH_CHECK(keySummary.dim() == 4 && keySummary.sym_stride(3) == 1 &&
+            (keySummary.sym_size(1) == 1 || keySummary.sym_stride(1) == 256) &&
+            keySummary.sym_stride(0) >= keySummary.sym_size(1) * 256 &&
+            keySummary.sym_stride(0) * keySummary.element_size() % 32 == 0 &&
+            keySummary.sym_storage_offset() * keySummary.element_size() % 32 == 0,
+            "TopK-only Key requires aligned page-inner-contiguous storage");
+        TORCH_CHECK(ids.dim() == 3 && ids.sym_size(0) == query.sym_size(1) &&
+            ids.sym_size(1) == query.sym_size(0) && ids.sym_size(2) == topK && ids.scalar_type() == at::kInt &&
+            ids.sym_storage_offset() % 8 == 0, "selected_region_ids must be aligned INT32 [G,T,top_k]");
+    }
     return {scores, ids};
+}
+at::Tensor npu_indexer_region_score_topk_out_meta(
+    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
+    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
+    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
+{
+    return std::get<1>(npu_indexer_region_score_meta<false>(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, selectedIds));
+}
+at::Tensor npu_indexer_region_score_topk_meta(
+    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
+    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
+    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode)
+{
+    return std::get<1>(npu_indexer_region_score_meta<false>(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, c10::nullopt));
 }
 
 void npu_fused_quant_lightning_indexer_manage_meta(
@@ -1838,7 +1873,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::npu_generic_block_sparse_attention_meta);
     ops.impl("npu_sparse_flash_mla_metadata", &vllm_ascend::meta::npu_sparse_flash_mla_metadata_meta);
     ops.impl("npu_sparse_flash_mla", &vllm_ascend::meta::npu_sparse_flash_mla_meta);
-    ops.impl("npu_indexer_region_score", &vllm_ascend::meta::npu_indexer_region_score_meta);
+    ops.impl("npu_indexer_region_score", &vllm_ascend::meta::npu_indexer_region_score_meta<true>);
+    ops.impl("npu_indexer_region_score_topk", &vllm_ascend::meta::npu_indexer_region_score_topk_meta);
+    ops.impl("npu_indexer_region_score_topk.out", &vllm_ascend::meta::npu_indexer_region_score_topk_out_meta);
     ops.impl("npu_k2q_csr", &vllm_ascend::meta::npu_k2q_csr_meta);
     ops.impl("npu_sparse_attention_score_prefill",
              &vllm_ascend::meta::npu_sparse_attention_score_prefill_meta);

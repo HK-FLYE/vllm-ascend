@@ -18,12 +18,18 @@ ge::graphStatus InferShape(gert::InferShapeContext *context)
     if (!regions || !topK || *regions < 0 || *topK <= 0 || *topK > 512) return ge::GRAPH_FAILED;
     if (!cacheMode || !maskMode || !sortMode || *cacheMode != 1 || *maskMode != 3 || *sortMode != 1)
         return ge::GRAPH_FAILED;
-    const int64_t capacity = output->GetDimNum() == 3 && output->GetDim(0) == q->GetDim(1) &&
-        output->GetDim(1) == q->GetDim(0) && output->GetDim(2) >= *regions ? output->GetDim(2) : *regions;
-    output->SetDimNum(3);
-    output->SetDim(0, q->GetDim(1));
-    output->SetDim(1, q->GetDim(0));
-    output->SetDim(2, capacity);
+    const auto *returnScore = attrs->GetAttrPointer<bool>(7);
+    if (returnScore && !*returnScore) {
+        output->SetDimNum(1);
+        output->SetDim(0, 0);
+    } else {
+        const int64_t capacity = output->GetDimNum() == 3 && output->GetDim(0) == q->GetDim(1) &&
+            output->GetDim(1) == q->GetDim(0) && output->GetDim(2) >= *regions ? output->GetDim(2) : *regions;
+        output->SetDimNum(3);
+        output->SetDim(0, q->GetDim(1));
+        output->SetDim(1, q->GetDim(0));
+        output->SetDim(2, capacity);
+    }
     ids->SetDimNum(3);
     ids->SetDim(0, q->GetDim(1));
     ids->SetDim(1, q->GetDim(0));

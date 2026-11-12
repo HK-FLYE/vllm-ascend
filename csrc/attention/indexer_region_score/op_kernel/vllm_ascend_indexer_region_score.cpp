@@ -49,19 +49,38 @@ extern "C" __global__ __aicore__ void vllm_ascend_indexer_region_score(
             local[i] = global[i];
         }
         AscendC::TPipe pipe;
-        if (data.headsPerGroup == PAGED_H) {
-            DispatchScore<true>(query, weights, pagedKeySummary, actualKvLengths,
-                blockTable, cuSeqLens, output, data, &pipe);
-        } else {
-            DispatchScore<false>(query, weights, pagedKeySummary, actualKvLengths,
-                blockTable, cuSeqLens, output, data, &pipe);
+        if (data.batchTokens != 0U) {
+            output = GetUserWorkspace(workspace) + data.scorePoolOffset;
         }
-        AscendC::SyncAll<false>();
-        if ASCEND_IS_AIV {
+        do {
+            data.batchCount = data.batchTokens == 0U ? data.totalTokens :
+                PagedMin(data.batchTokens, data.totalTokens - data.batchBegin);
+            if (data.headsPerGroup == PAGED_H) {
+                DispatchScore<true>(query, weights, pagedKeySummary, actualKvLengths,
+                    blockTable, cuSeqLens, output, data, &pipe);
+            } else {
+                DispatchScore<false>(query, weights, pagedKeySummary, actualKvLengths,
+                    blockTable, cuSeqLens, output, data, &pipe);
+            }
+            AscendC::SyncAll<false>();
+            if ASCEND_IS_AIV {
+                pipe.Reset();
+                RegionSelector select;
+                select.Init(output, actualKvLengths, cuSeqLens, selectedRegionIds, data, &pipe);
+                select.Process();
+            }
+            if (data.batchTokens == 0U) break;
+            data.batchBegin += data.batchCount;
+            if (data.batchBegin == data.totalTokens) break;
+            AscendC::SyncAll<false>();
             pipe.Reset();
-            RegionSelector select;
-            select.Init(output, actualKvLengths, cuSeqLens, selectedRegionIds, data, &pipe);
-            select.Process();
-        }
+            if ASCEND_IS_AIC {
+                // Reset preserves TPipe's three initial M_MTE1 hardware permits.
+                // Reserve their IDs again; Destroy consumes them after the last batch.
+                for (uint32_t i = 0U; i < 3U; ++i) {
+                    (void)pipe.AllocEventID<HardEvent::M_MTE1>();
+                }
+            }
+        } while (data.batchBegin < data.totalTokens);
     }
 }

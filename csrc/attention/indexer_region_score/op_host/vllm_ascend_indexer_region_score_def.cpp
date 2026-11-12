@@ -32,6 +32,7 @@ public:
         this->Attr("cache_mode").AttrType(OPTIONAL).Int(1);
         this->Attr("mask_mode").AttrType(OPTIONAL).Int(3);
         this->Attr("sort_mode").AttrType(OPTIONAL).Int(1);
+        this->Attr("return_score").AttrType(OPTIONAL).Bool(true);
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true).DynamicFormatFlag(false).DynamicRankSupportFlag(false)
             .DynamicShapeSupportFlag(true).NeedCheckSupportFlag(false).PrecisionReduceFlag(true)

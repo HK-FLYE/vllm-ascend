@@ -8,6 +8,7 @@
 #include "register/op_impl_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "indexer_region_score_shard_plan.h"
+#include "indexer_region_score_bounded_workspace.h"
 #include "../op_kernel/indexer_region_score_paged_tiling_data.h"
 namespace optiling {
 namespace {
@@ -26,6 +27,8 @@ ge::graphStatus Tiling(gert::TilingContext *context)
     const auto *cacheMode = attrs->GetAttrPointer<int64_t>(4);
     const auto *maskMode = attrs->GetAttrPointer<int64_t>(5);
     const auto *sortMode = attrs->GetAttrPointer<int64_t>(6);
+    const auto *returnScore = attrs->GetAttrPointer<bool>(7);
+    const bool fullScore = returnScore == nullptr || *returnScore;
     OP_CHECK_NULL_WITH_CONTEXT(context, regions);
     OP_CHECK_NULL_WITH_CONTEXT(context, topK);
     OP_CHECK_NULL_WITH_CONTEXT(context, regionSize);
@@ -50,7 +53,7 @@ ge::graphStatus Tiling(gert::TilingContext *context)
     const auto &ids = context->GetOutputShape(1)->GetOriginShape();
     OP_CHECK_IF(q.GetDimNum() != 4 || w.GetDimNum() != 3 || k.GetDimNum() != 4 ||
         lengths.GetDimNum() != 1 || table.GetDimNum() != 2 || cu.GetDimNum() != 1 ||
-        out.GetDimNum() != 3 || ids.GetDimNum() != 3,
+        (fullScore ? out.GetDimNum() != 3 : out.GetDimNum() != 1 || out.GetDim(0) != 0) || ids.GetDimNum() != 3,
         OP_LOGE(context, "invalid tensor ranks"), return ge::GRAPH_FAILED);
     const int64_t groups = q.GetDim(1), heads = q.GetDim(2);
     OP_CHECK_IF(q.GetDim(0) <= 0 || q.GetDim(0) > INT32_MAX || groups <= 0 ||
@@ -65,8 +68,8 @@ ge::graphStatus Tiling(gert::TilingContext *context)
         return ge::GRAPH_FAILED);
     OP_CHECK_IF(*regions < 0 || *regions > MAX_REGIONS || *regions > table.GetDim(1) * k.GetDim(1) ||
         *topK <= 0 || *topK > MAX_TOP_K || *regionSize <= 0 || *regionSize > INT32_MAX ||
-        !std::isfinite(*headScale) || out.GetDim(0) != groups || out.GetDim(1) != q.GetDim(0) ||
-        out.GetDim(2) < *regions || out.GetDim(2) > UINT32_MAX || ids.GetDim(0) != groups ||
+        !std::isfinite(*headScale) || (fullScore && (out.GetDim(0) != groups || out.GetDim(1) != q.GetDim(0) ||
+        out.GetDim(2) < *regions || out.GetDim(2) > UINT32_MAX)) || ids.GetDim(0) != groups ||
         ids.GetDim(1) != q.GetDim(0) || ids.GetDim(2) != *topK,
         OP_LOGE(context, "invalid scalar attributes or output shapes"), return ge::GRAPH_FAILED);
     const auto qtype = context->GetInputDesc(0)->GetDataType();
@@ -148,13 +151,24 @@ ge::graphStatus Tiling(gert::TilingContext *context)
     data.weightStrideGroup = heads;
     data.cacheStrideRegion = DIM;
     data.blockTableStrideRequest = data.pageCols;
-    data.outputStrideToken = out.GetDim(2);
+    data.outputStrideToken = fullScore ? out.GetDim(2) : 0U;
     data.outputStrideGroup = data.totalTokens * data.outputStrideToken;
     data.regionSize = *regionSize;
     data.selectionConfig = static_cast<uint32_t>(*topK) | (1U << 16);
     auto *workspace = context->GetWorkspaceSizes(1);
     OP_CHECK_NULL_WITH_CONTEXT(context, workspace);
     workspace[0] = platform.GetLibApiWorkSpaceSize();
+    if (!fullScore) {
+        IndexerRegionScoreHost::BoundedWorkspacePlan bounded;
+        OP_CHECK_IF(!IndexerRegionScoreHost::PlanBoundedWorkspace(workspace[0], groups, data.totalTokens,
+            data.seqK, data.qTile, bounded), OP_LOGE(context, "TopK-only needs more than the 256 MiB workspace budget"),
+            return ge::GRAPH_FAILED);
+        data.batchTokens = bounded.batchTokens;
+        data.scorePoolOffset = bounded.scorePoolOffset;
+        data.outputStrideToken = bounded.regionStride;
+        data.outputStrideGroup = data.batchTokens * bounded.regionStride;
+        workspace[0] = bounded.totalBytes;
+    }
     context->SetBlockDim(platform.CalcTschBlockDim(data.usedCubeCores * 2, aic, aiv));
     context->SetScheduleMode(1);
     context->SetTilingKey(TILING_KEY);

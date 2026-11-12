@@ -61,3 +61,51 @@ def indexer_region_score(
         out,
         selected_region_ids,
     )
+
+
+def indexer_region_score_topk(
+    query: torch.Tensor,
+    weights: torch.Tensor,
+    key_summary: torch.Tensor,
+    actual_kv_lengths: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    *,
+    max_region_len: int,
+    top_k: int = 512,
+    region_size: int = 8,
+    head_scale: float = 1.0,
+    cache_mode: int = 1,
+    mask_mode: int = 3,
+    sort_mode: int = 1,
+    selected_region_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return the same IDs without a dense score output, within 256 MiB workspace.
+
+    Shape, dtype and masking follow :func:`indexer_region_score`. Q, weights,
+    metadata and IDs must be contiguous; Key may use an aligned paged view.
+    Caller IDs require a 32-byte aligned storage base and INT32 offset divisible
+    by eight. Unsupported layouts and a minimum batch exceeding the budget are rejected.
+    Omit ``selected_region_ids`` for the functional graph path.
+    """
+    if (cache_mode, mask_mode, sort_mode) != (1, 3, 1):
+        raise ValueError("only cache_mode=1, mask_mode=3 and sort_mode=1 are supported")
+    args = (
+        query,
+        weights,
+        key_summary,
+        actual_kv_lengths,
+        block_table,
+        cu_seq_lens,
+        max_region_len,
+        top_k,
+        region_size,
+        head_scale,
+        cache_mode,
+        mask_mode,
+        sort_mode,
+    )
+    op = torch.ops._C_ascend.npu_indexer_region_score_topk
+    if selected_region_ids is None:
+        return op.default(*args)
+    return op.out(*args, selected_region_ids=selected_region_ids)

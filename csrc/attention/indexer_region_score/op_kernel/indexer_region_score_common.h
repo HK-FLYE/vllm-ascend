@@ -539,8 +539,9 @@ private:
     {
         const uint32_t core = PairCore();
         const uint32_t rangeUnit = tiling_.qTile;
+        const uint32_t tokens = tiling_.batchTokens != 0U ? tiling_.batchCount : tiling_.totalTokens;
         const uint32_t totalQRanges =
-            (tiling_.totalTokens + rangeUnit - 1U) / rangeUnit;
+            (tokens + rangeUnit - 1U) / rangeUnit;
         const uint32_t totalKRanges =
             (tiling_.seqK + tiling_.kTile - 1U) / tiling_.kTile;
         const uint32_t qShard = core / tiling_.kShardCount;
@@ -552,8 +553,8 @@ private:
             qShard * qRangesPerShard + PagedMin(qShard, qExtra);
         const uint32_t localQRanges =
             qRangesPerShard + (qShard < qExtra ? 1U : 0U);
-        qBegin = firstQRange * rangeUnit;
-        qEnd = PagedMin(tiling_.totalTokens,
+        qBegin = tiling_.batchBegin + firstQRange * rangeUnit;
+        qEnd = tiling_.batchBegin + PagedMin(tokens,
                         (firstQRange + localQRanges) * rangeUnit);
 
         const uint32_t kRangesPerShard = totalKRanges / tiling_.kShardCount;
@@ -1146,7 +1147,7 @@ private:
         WaitFlag<HardEvent::V_MTE3>(vectorToMte3_);
         const uint64_t outputOffset =
             static_cast<uint64_t>(group) * tiling_.outputStrideGroup +
-            static_cast<uint64_t>(firstQ) * tiling_.outputStrideToken + kStart;
+            static_cast<uint64_t>(firstQ - tiling_.batchBegin) * tiling_.outputStrideToken + kStart;
         if (CanUseOutput2D(kCount)) {
             DataCopyExtParams params{
                 static_cast<uint16_t>(rowCount),

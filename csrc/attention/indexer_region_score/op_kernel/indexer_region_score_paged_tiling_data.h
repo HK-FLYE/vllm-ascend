@@ -47,13 +47,19 @@ struct alignas(8) PagedTilingData {
     uint32_t regionSize;
     // 位 [15:0] 为 topK，位 16 为 ID 排序，位 17 为 scratch 对齐。
     uint32_t selectionConfig;
+    // Zero batchTokens selects the full-score path; coordinates stay global.
+    uint32_t batchTokens;
+    uint32_t batchBegin;
+    uint32_t batchCount;
+    uint32_t batchReserved;
+    uint64_t scorePoolOffset; // bytes relative to the kernel workspace pointer
 };
 static_assert(offsetof(PagedTilingData, pageLoadMode) == 160, "page-load ABI offset");
 static_assert(offsetof(PagedTilingData, regionSize) == 168, "region-size ABI offset");
 static_assert(offsetof(PagedTilingData, selectionConfig) == 172, "selection ABI offset");
 static_assert(sizeof(PagedTilingData) % 8 == 0, "paged tiling must be naturally aligned");
 static_assert(offsetof(PagedTilingData, keyPagesPerMacro) == 52, "key-pages ABI offset");
-static_assert(sizeof(PagedTilingData) == 176, "update every paged tiling-data packer");
+static_assert(sizeof(PagedTilingData) == 200, "update every paged tiling-data packer");
 } // 命名空间 IndexerRegionScorePaged
 
 // CANN Tiling 注册宏要求标准 Host 命名空间；此别名供 Host 与设备入口共用。

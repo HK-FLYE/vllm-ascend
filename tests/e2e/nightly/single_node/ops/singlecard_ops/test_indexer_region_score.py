@@ -38,6 +38,11 @@ def region_score():
     return module.indexer_region_score
 
 
+@pytest.fixture(scope="module")
+def region_score_topk(region_score):
+    return region_score.__globals__["indexer_region_score_topk"]
+
+
 def make_inputs(
     dtype,
     weight_dtype,
@@ -160,6 +165,111 @@ def check_case(
 @pytest.mark.parametrize("query_lengths,regions,page_size,top_k,histories", SCENARIOS)
 def test_paged_region_score(region_score, dtype, weight_dtype, query_lengths, regions, page_size, top_k, histories):
     check_case(region_score, dtype, weight_dtype, query_lengths, regions, page_size, top_k, histories)
+
+
+@pytest.mark.parametrize("dtype", QK_DTYPES)
+def test_topk_only_matches_full_score_and_supports_preallocated_ids(region_score, region_score_topk, dtype):
+    query, weights, backing, lengths, table, cu = make_inputs(
+        dtype, torch.float32, (4,), 65, 16, (65,), groups=4, heads=12
+    )
+    inputs = tuple(tensor.npu() for tensor in (query, weights, backing[:, 1], lengths, table, cu))
+    scores, expected_ids = region_score(*inputs, max_region_len=65, top_k=17, head_scale=0.5)
+    del scores
+    torch.npu.synchronize()
+
+    ids = region_score_topk(*inputs, max_region_len=65, top_k=17, head_scale=0.5)
+    torch.testing.assert_close(ids.cpu(), expected_ids.cpu(), rtol=0, atol=0)
+
+    selected = torch.empty_like(ids)
+    returned = region_score_topk(*inputs, max_region_len=65, top_k=17, head_scale=0.5, selected_region_ids=selected)
+    assert returned.data_ptr() == selected.data_ptr()
+    torch.testing.assert_close(returned.cpu(), expected_ids.cpu(), rtol=0, atol=0)
+
+
+def test_topk_only_meta_default_and_out_shapes(region_score_topk):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        query = torch.empty((9, 4, 12, HEAD_DIM), dtype=torch.bfloat16)
+        weights = torch.empty((9, 4, 12), dtype=torch.float32)
+        key = torch.empty((8, 16, 1, HEAD_DIM), dtype=torch.bfloat16)
+        lengths = torch.empty((1,), dtype=torch.int32)
+        table = torch.empty((1, 8), dtype=torch.int32)
+        cu = torch.empty((2,), dtype=torch.int32)
+        ids = region_score_topk(query, weights, key, lengths, table, cu, max_region_len=65, top_k=17)
+        assert ids.shape == (4, 9, 17)
+        assert ids.dtype == torch.int32
+        selected = torch.empty((4, 9, 17), dtype=torch.int32)
+        returned = region_score_topk(
+            query,
+            weights,
+            key,
+            lengths,
+            table,
+            cu,
+            max_region_len=65,
+            top_k=17,
+            selected_region_ids=selected,
+        )
+        assert returned is selected
+
+
+def test_topk_only_rejects_unsupported_layouts(region_score_topk):
+    query = torch.empty((4, 1, 4, 512), dtype=torch.bfloat16, device="npu")[..., ::2]
+    weights = torch.zeros((4, 1, 4), dtype=torch.float32, device="npu")
+    key = torch.zeros((9, 8, 1, HEAD_DIM), dtype=torch.bfloat16, device="npu")
+    lengths = torch.tensor((80,), dtype=torch.int32, device="npu")
+    table = torch.arange(9, dtype=torch.int32, device="npu").view(1, 9)
+    cu = torch.tensor((0, 4), dtype=torch.int32, device="npu")
+    args = (query, weights, key, lengths, table, cu)
+    with pytest.raises(RuntimeError, match="contiguous|TopK-only"):
+        region_score_topk(*args, max_region_len=65, top_k=17)
+
+    query = query.contiguous()
+    ids_storage = torch.empty(4 * 17 + 1, dtype=torch.int32, device="npu")
+    unaligned_ids = ids_storage[1:].view(1, 4, 17)
+    assert unaligned_ids.is_contiguous() and unaligned_ids.storage_offset() % 8 != 0
+    with pytest.raises(RuntimeError, match="aligned|TopK-only"):
+        region_score_topk(query, *args[1:], max_region_len=65, top_k=17, selected_region_ids=unaligned_ids)
+
+
+@pytest.mark.parametrize("dtype", QK_DTYPES)
+@pytest.mark.parametrize(
+    "tokens,groups,regions,heads,top_k",
+    ((2049, 1, 32769, 4, 512), (1901, 4, 9000, 12, 37), (3777, 1, 32769, 4, 512)),
+)
+def test_topk_only_forces_bounded_workspace_batch(region_score_topk, dtype, tokens, groups, regions, heads, top_k):
+    dim = HEAD_DIM
+    page_size = 8
+    pages = (regions + page_size - 1) // page_size
+    query = torch.zeros((tokens, groups, heads, dim), dtype=dtype, device="npu")
+    weights = torch.zeros((tokens, groups, heads), dtype=torch.float32, device="npu")
+    key = torch.zeros((pages, page_size, 1, dim), dtype=dtype, device="npu")
+    table = torch.arange(pages, dtype=torch.int32, device="npu").expand(4, -1).contiguous()
+    split = tokens // 2
+    cu = torch.tensor((0, 0, split, split, tokens), dtype=torch.int32, device="npu")
+    lengths = torch.tensor(
+        (0, regions * REGION_SIZE + split, 0, tokens - split),
+        dtype=torch.int32,
+        device="npu",
+    )
+    dense_score_bytes = groups * tokens * regions * torch.empty((), dtype=torch.float32).element_size()
+    budget_bytes = 256 * 1024**2
+    assert dense_score_bytes > budget_bytes
+
+    start_allocated = torch.npu.memory_allocated()
+    torch.npu.reset_peak_memory_stats()
+    ids = region_score_topk(query, weights, key, lengths, table, cu, max_region_len=regions, top_k=top_k)
+    torch.npu.synchronize()
+    expected = (
+        torch.arange(top_k, dtype=torch.int32, device="cpu").view(1, 1, top_k).expand(groups, tokens, top_k).clone()
+    )
+    visible = (torch.arange(tokens - split) // REGION_SIZE).clamp(max=regions)
+    expected[:, split:, :] = torch.where(torch.arange(top_k)[None, :] < visible[:, None], expected[:, split:, :], -1)
+    torch.testing.assert_close(ids.cpu(), expected, rtol=0, atol=0)
+    peak_delta = torch.npu.max_memory_allocated() - start_allocated
+    ids_bytes = groups * tokens * top_k * torch.empty((), dtype=torch.int32).element_size()
+    assert peak_delta <= budget_bytes + ids_bytes + 4 * 1024**2, (peak_delta, budget_bytes, ids_bytes)
 
 
 @pytest.mark.parametrize("dtype", QK_DTYPES)

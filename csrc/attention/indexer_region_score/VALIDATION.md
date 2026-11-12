@@ -1,5 +1,10 @@
 # Migration validation
 
+The 2026-11-12 IDs-only extension, current 3498-line code count, bounded
+workspace measurements and final regression results are recorded in
+[TopK-only validation](TOPK_ONLY_VALIDATION.md). The results below describe
+the preceding complete-score migration as validated on 2026-11-10.
+
 Validated on 2026-11-10 with Ascend950PR, CANN 9.2.0, PyTorch 2.10.0 and
 torch_npu 2.10.0.post6. Device tests used the compiled repository Torch
 extension and an independently installed custom OPP package.

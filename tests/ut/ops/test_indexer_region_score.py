@@ -14,12 +14,14 @@ def load_wrapper():
     spec = importlib.util.spec_from_file_location("indexer_region_score_wrapper", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.indexer_region_score
+    return module
 
 
 class TestIndexerRegionScore(unittest.TestCase):
     def setUp(self):
-        self.call = load_wrapper()
+        wrapper = load_wrapper()
+        self.call = wrapper.indexer_region_score
+        self.topk = wrapper.indexer_region_score_topk
         self.inputs = (
             torch.empty(2, 1, 4, 256),
             torch.empty(2, 1, 4),
@@ -127,6 +129,33 @@ class TestIndexerRegionScore(unittest.TestCase):
                         self.assertRaisesRegex(ValueError, "cache_mode|mask_mode|sort_mode"),
                     ):
                         self.call(*self.inputs, max_region_len=32, **{parameter: value})
+            op.assert_not_called()
+
+    def test_topk_only_default_dispatch_returns_ids(self):
+        ids = torch.empty(1, 2, 3, dtype=torch.int32)
+        operator = unittest.mock.MagicMock()
+        operator.default.return_value = ids
+        with patch.object(torch.ops._C_ascend, "npu_indexer_region_score_topk", operator, create=True):
+            actual = self.topk(*self.inputs, max_region_len=29, top_k=3, region_size=4, head_scale=0.5)
+        operator.default.assert_called_once_with(*self.inputs, 29, 3, 4, 0.5, 1, 3, 1)
+        operator.out.assert_not_called()
+        self.assertIs(actual, ids)
+
+    def test_topk_only_out_dispatch_preserves_id_alias(self):
+        ids = torch.empty(1, 2, 3, dtype=torch.int32)
+        operator = unittest.mock.MagicMock()
+        operator.out.return_value = ids
+        with patch.object(torch.ops._C_ascend, "npu_indexer_region_score_topk", operator, create=True):
+            actual = self.topk(*self.inputs, max_region_len=29, top_k=3, selected_region_ids=ids)
+        operator.out.assert_called_once_with(*self.inputs, 29, 3, 8, 1.0, 1, 3, 1, selected_region_ids=ids)
+        operator.default.assert_not_called()
+        self.assertIs(actual, ids)
+
+    def test_topk_only_rejects_unsupported_modes_before_dispatch(self):
+        with patch.object(torch.ops._C_ascend, "npu_indexer_region_score_topk", create=True) as op:
+            for parameter, value in (("cache_mode", 0), ("mask_mode", 0), ("sort_mode", 0)):
+                with self.subTest(parameter=parameter), self.assertRaisesRegex(ValueError, parameter):
+                    self.topk(*self.inputs, max_region_len=32, **{parameter: value})
             op.assert_not_called()
 
 

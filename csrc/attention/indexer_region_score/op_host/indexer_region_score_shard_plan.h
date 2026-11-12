@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <tuple>
 namespace IndexerRegionScoreHost {
 constexpr uint32_t kProxyDim = 256;
 constexpr uint32_t kCubeMRows = 128;
@@ -19,24 +20,6 @@ struct QkShardPlan {
     uint32_t qShards;
     uint32_t kShards;
 };
-inline bool PreferTrafficPlan(uint64_t maxTiles, uint64_t traffic, uint32_t cores,
-    uint64_t trafficPlanMaxTiles, uint64_t trafficPlanBytes, uint32_t trafficPlanCores)
-{
-    return maxTiles < trafficPlanMaxTiles ||
-                (maxTiles == trafficPlanMaxTiles && traffic < trafficPlanBytes) ||
-                (maxTiles == trafficPlanMaxTiles && traffic == trafficPlanBytes &&
-                 cores > trafficPlanCores);
-}
-inline bool PreferGatherPlan(uint64_t maxTiles, uint64_t gatherCommands, uint64_t traffic, uint32_t cores,
-    uint64_t gatherPlanMaxTiles, uint64_t gatherPlanCommands, uint64_t gatherPlanBytes, uint32_t gatherPlanCores)
-{
-    return maxTiles < gatherPlanMaxTiles ||
-                (maxTiles == gatherPlanMaxTiles && gatherCommands < gatherPlanCommands) ||
-                (maxTiles == gatherPlanMaxTiles && gatherCommands == gatherPlanCommands &&
-                 traffic < gatherPlanBytes) ||
-                (maxTiles == gatherPlanMaxTiles && gatherCommands == gatherPlanCommands &&
-                 traffic == gatherPlanBytes && cores > gatherPlanCores);
-}
 inline QkShardPlan SelectQkShardPlan(uint32_t qRanges, uint32_t kRanges,
                               uint32_t pairCapacity, uint32_t groups,
                               uint32_t summariesPerPage, uint32_t qMicroTile,
@@ -44,14 +27,10 @@ inline QkShardPlan SelectQkShardPlan(uint32_t qRanges, uint32_t kRanges,
 {
     QkShardPlan trafficPlan{1U, 1U};
     QkShardPlan gatherPlan{1U, 1U};
-    uint64_t trafficPlanMaxTiles = std::numeric_limits<uint64_t>::max();
-    uint64_t trafficPlanBytes = std::numeric_limits<uint64_t>::max();
-    uint64_t trafficPlanGatherCommands = std::numeric_limits<uint64_t>::max();
-    uint32_t trafficPlanCores = 0U;
-    uint64_t gatherPlanMaxTiles = std::numeric_limits<uint64_t>::max();
-    uint64_t gatherPlanBytes = std::numeric_limits<uint64_t>::max();
-    uint64_t gatherPlanCommands = std::numeric_limits<uint64_t>::max();
-    uint32_t gatherPlanCores = 0U;
+    const auto maxCost = std::numeric_limits<uint64_t>::max();
+    auto trafficCost = std::make_tuple(maxCost, maxCost, UINT32_MAX);
+    auto gatherCost = std::make_tuple(maxCost, maxCost, maxCost, UINT32_MAX);
+    uint64_t trafficPlanGatherCommands = maxCost;
     const uint32_t maxQShards = std::min(qRanges, pairCapacity);
     for (uint32_t qShards = 1U; qShards <= maxQShards; ++qShards) {
         const uint32_t maxKShards = std::min(kRanges, pairCapacity / qShards);
@@ -67,19 +46,16 @@ inline QkShardPlan SelectQkShardPlan(uint32_t qRanges, uint32_t kRanges,
             const uint64_t gatherCommands = static_cast<uint64_t>(qShards) * kRanges *
                 ((keyTile + summariesPerPage - 1U) / summariesPerPage);
             const uint32_t cores = qShards * kShards;
-            if (PreferTrafficPlan(maxTiles, traffic, cores, trafficPlanMaxTiles, trafficPlanBytes, trafficPlanCores)) {
+            const auto candidateTraffic = std::make_tuple(maxTiles, traffic, pairCapacity - cores);
+            if (candidateTraffic < trafficCost) {
                 trafficPlan = {qShards, kShards};
-                trafficPlanMaxTiles = maxTiles;
-                trafficPlanBytes = traffic;
+                trafficCost = candidateTraffic;
                 trafficPlanGatherCommands = gatherCommands;
-                trafficPlanCores = cores;
             }
-            if (PreferGatherPlan(maxTiles, gatherCommands, traffic, cores, gatherPlanMaxTiles, gatherPlanCommands, gatherPlanBytes, gatherPlanCores)) {
+            const auto candidateGather = std::make_tuple(maxTiles, gatherCommands, traffic, pairCapacity - cores);
+            if (candidateGather < gatherCost) {
                 gatherPlan = {qShards, kShards};
-                gatherPlanMaxTiles = maxTiles;
-                gatherPlanBytes = traffic;
-                gatherPlanCommands = gatherCommands;
-                gatherPlanCores = cores;
+                gatherCost = candidateGather;
             }
         }
     }
@@ -87,9 +63,9 @@ inline QkShardPlan SelectQkShardPlan(uint32_t qRanges, uint32_t kRanges,
         return trafficPlan;
     }
     const uint32_t minimumUsefulCores = (pairCapacity * 3U + 3U) / 4U;
-    const bool controlsGatherBottleneck = gatherPlanCommands < trafficPlanGatherCommands &&
-        gatherPlan.qShards >= 2U && gatherPlanCores >= minimumUsefulCores &&
-        gatherPlanBytes <= trafficPlanBytes * 2U;
+    const bool controlsGatherBottleneck = std::get<1>(gatherCost) < trafficPlanGatherCommands &&
+        gatherPlan.qShards >= 2U && gatherPlan.qShards * gatherPlan.kShards >= minimumUsefulCores &&
+        std::get<2>(gatherCost) <= std::get<1>(trafficCost) * 2U;
     return controlsGatherBottleneck ? gatherPlan : trafficPlan;
 }
 struct PagedShardPlan {
@@ -169,11 +145,9 @@ inline PagedShardPlan SelectPagedRequestShardPlan(uint32_t totalTokens, uint32_t
     }
     const uint32_t qTile = std::max(1U, totalTokens / nonempty);
     const uint32_t qRanges = static_cast<uint32_t>(ShardCeilDiv(totalTokens, qTile));
-    const uint32_t groupBlocks = groups;
     QkShardPlan best{1U, 1U};
-    uint64_t bestCost = std::numeric_limits<uint64_t>::max();
-    uint64_t bestTraffic = std::numeric_limits<uint64_t>::max();
-    uint32_t bestCores = 0U;
+    const auto maxCost = std::numeric_limits<uint64_t>::max();
+    auto bestCost = std::make_tuple(maxCost, maxCost, UINT32_MAX);
     for (uint32_t qShards = 1U; qShards <= std::min(qRanges, pairCapacity); ++qShards) {
         uint64_t maxMicroTiles = 0U;
         uint64_t maxRequestSegments = 0U;
@@ -189,17 +163,15 @@ inline PagedShardPlan SelectPagedRequestShardPlan(uint32_t totalTokens, uint32_t
             totalRequestSegments += work.requestSegments;
         }
         for (uint32_t kShards = 1U; kShards <= std::min(kRanges, pairCapacity / qShards); ++kShards) {
-            const uint64_t cost = maxMicroTiles * groupBlocks * ShardCeilDiv(kRanges, kShards) +
+            const uint64_t cost = maxMicroTiles * groups * ShardCeilDiv(kRanges, kShards) +
                 maxRequestSegments;
             const uint64_t traffic = totalRequestSegments * kRanges * keyTile * kProxyDim +
                 static_cast<uint64_t>(kShards) * totalTokens * groups * heads * kProxyDim;
             const uint32_t cores = qShards * kShards;
-            if (cost < bestCost || (cost == bestCost && traffic < bestTraffic) ||
-                (cost == bestCost && traffic == bestTraffic && cores > bestCores)) {
+            const auto candidate = std::make_tuple(cost, traffic, pairCapacity - cores);
+            if (candidate < bestCost) {
                 best = {qShards, kShards};
-                bestCost = cost;
-                bestTraffic = traffic;
-                bestCores = cores;
+                bestCost = candidate;
             }
         }
     }

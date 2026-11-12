@@ -129,20 +129,9 @@ private:
                                                      uint32_t kCount, uint32_t slot,
                                                      uint32_t kRowsAlign)
     {
-        // Use the whole-page scanner when macro boundaries are page-aligned.
-        if constexpr (!PARTIAL_PAGES) {
-            return ScanAlignedMacroPageRuns(request, kStart, kCount, slot, kRowsAlign);
-        } else {
-            return ScanPartialMacroPageRuns(request, kStart, kCount, slot, kRowsAlign);
-        }
-    }
-
-    __aicore__ inline uint32_t ScanAlignedMacroPageRuns(uint32_t request, uint32_t kStart,
-                                                     uint32_t kCount, uint32_t slot,
-                                                     uint32_t kRowsAlign)
-    {
         const uint32_t firstPage = kStart / tiling_.summariesPerPage;
-        const uint32_t pageCount = (kCount + tiling_.summariesPerPage - 1U) /
+        const uint32_t firstOffset = PARTIAL_PAGES ? kStart % tiling_.summariesPerPage : 0U;
+        const uint32_t pageCount = (firstOffset + kCount + tiling_.summariesPerPage - 1U) /
             tiling_.summariesPerPage;
         if (pageCount == 0U || pageCount > kPagedMaxPagesPerMacro ||
             firstPage > tiling_.pageCols || pageCount > tiling_.pageCols - firstPage) {
@@ -157,7 +146,7 @@ private:
             kRowsAlign == kPagedKeyMacro && kStart % tiling_.summariesPerPage == 0U &&
             kCount % tiling_.summariesPerPage == 0U &&
             static_cast<uint64_t>(kCount) * QkInputDim(tiling_) * sizeof(QkInputType) == kPagedKeyL1Bytes;
-        const bool cachePages = fullSlotCoverage && pageCount <= kCachedPageIds;
+        const bool cachePages = !PARTIAL_PAGES && fullSlotCoverage && pageCount <= kCachedPageIds;
         bool allPagesValid = cachePages;
         bool hasAdjacentRun = false;
         bool positiveAffine = cachePages && pageCount > 1U;
@@ -275,60 +264,11 @@ private:
                 }
             }
             if (!zeroFill) {
-                const uint32_t logicalRow = localPage * tiling_.summariesPerPage;
-                const uint32_t rowsRemaining = kCount - logicalRow;
-                const uint32_t runRows = MinValue(length * tiling_.summariesPerPage,
-                                                   rowsRemaining);
-                CopyContiguousRunToL1(slot, logicalRow, runRows, page, kRowsAlign);
-            }
-            ++runCount;
-            localPage += length;
-        }
-        return runCount;
-    }
-
-    __aicore__ inline uint32_t ScanPartialMacroPageRuns(uint32_t request, uint32_t kStart,
-                                                     uint32_t kCount, uint32_t slot,
-                                                     uint32_t kRowsAlign)
-    {
-        const uint32_t firstPage = kStart / tiling_.summariesPerPage;
-        const uint32_t firstOffset = kStart % tiling_.summariesPerPage;
-        const uint32_t pageCount = (firstOffset + kCount + tiling_.summariesPerPage - 1U) /
-            tiling_.summariesPerPage;
-        if (pageCount == 0U || pageCount > kPagedMaxPagesPerMacro ||
-            firstPage > tiling_.pageCols || pageCount > tiling_.pageCols - firstPage) {
-            return 0U;
-        }
-        // 初始化后无效页和未用 K 尾部保持为零，有效物理页段再按需覆盖。
-        ZeroKeyL1Slot(slot);
-
-        uint32_t runCount = 0U;
-        const uint64_t tableBase = static_cast<uint64_t>(request) *
-            tiling_.blockTableStrideRequest + firstPage;
-        for (uint32_t localPage = 0U; localPage < pageCount;) {
-            const int32_t page = blockTableGm_.GetValue(tableBase + localPage);
-            const bool zeroFill = page < 0 || static_cast<uint64_t>(page) >= tiling_.numPhysicalPages;
-            uint32_t length = 1U;
-            if (pagesContiguous_ || zeroFill) {
-                while (localPage + length < pageCount) {
-                    const int32_t nextPage = blockTableGm_.GetValue(tableBase + localPage + length);
-                    const bool nextZeroFill = nextPage < 0 ||
-                        static_cast<uint64_t>(nextPage) >= tiling_.numPhysicalPages;
-                    if (nextZeroFill != zeroFill ||
-                        (!zeroFill && static_cast<int64_t>(nextPage) !=
-                            static_cast<int64_t>(page) + static_cast<int64_t>(length))) {
-                        break;
-                    }
-                    ++length;
-                }
-            }
-            if (!zeroFill) {
                 const uint32_t pageRow = localPage * tiling_.summariesPerPage;
                 const uint32_t logicalRow = pageRow > firstOffset ? pageRow - firstOffset : 0U;
                 const uint32_t sourceInPageRow = localPage == 0U ? firstOffset : 0U;
-                const uint32_t rowsRemaining = kCount - logicalRow;
                 const uint32_t runRows = MinValue(length * tiling_.summariesPerPage - sourceInPageRow,
-                                                   rowsRemaining);
+                    kCount - logicalRow);
                 CopyContiguousRunToL1(slot, logicalRow, runRows, page, kRowsAlign, sourceInPageRow);
             }
             ++runCount;

@@ -42,6 +42,45 @@ nonzero layer offsets retain zero-copy access; other key layouts are
 materialized. Optional `out` and `selected_region_ids` buffers are reused.
 Output views must not overlap internally, with inputs, or with each other.
 
+To omit the public score tensor, use the separate IDs-only API:
+
+```python
+from vllm_ascend.ops.indexer_region_score import indexer_region_score_topk
+
+region_ids = indexer_region_score_topk(
+    query, weights, key_summary, actual_kv_lengths, block_table, cu_seq_lens,
+    max_region_len=8192, top_k=512,
+    # selected_region_ids=preallocated_ids,  # optional [G,T,top_k] INT32 buffer
+)
+```
+
+Its scoring, causal visibility, tie breaking, ID ordering and padding match the
+complete-score API. Omitting `out` from `indexer_region_score` still allocates
+and returns scores; it does not select IDs-only execution.
+
+IDs-only execution uses an internal, fixed **256 MiB total ACLNN workspace
+limit**, including the CANN library prefix and allocation reserve. It computes
+into a `[G,batch_T,roundup8(R)]` FP32 pool, selects IDs, and reuses the pool for
+the next token batch. Request positions remain global across batches. If even
+one token batch cannot fit, the call fails. Input storage and final IDs are
+outside this workspace limit; it is not a whole-model memory limit.
+
+Following the original bf16 TopK-only implementation, Query, weights, request
+metadata and the optional IDs buffer must be contiguous. Key supports aligned,
+page-inner-contiguous views, including inter-page gaps and layer offsets. The
+IDs buffer's storage base and view offset must be 32-byte aligned. Unsupported
+layouts are rejected without materializing full input copies. These stricter
+requirements apply to IDs-only execution; the complete-score interface keeps
+its noncontiguous input/output support.
+
+At the native layer, passing `output=nullptr` to
+`aclnnVllmAscendIndexerRegionScoreGetWorkspaceSize` selects the same bounded
+path. `aclnnVllmAscendIndexerRegionScoreTopKGetWorkspaceSize` and
+`aclnnVllmAscendIndexerRegionScoreTopK` provide convenience entry points.
+The internal GE score slot has shape `[0]` when disabled. No public workspace
+budget parameter is added. The migrated scope remains D=256, K<=512 and
+cache/mask/sort modes 1/3/1.
+
 For query token `j` within request `n`, the visible historical region count is
 `clamp((actual_kv_lengths[n] - query_length[n] + j) // region_size,
 0, max_region_len)`. For each visible region, the score is

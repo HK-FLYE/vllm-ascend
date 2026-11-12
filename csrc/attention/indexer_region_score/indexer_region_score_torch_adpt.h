@@ -6,6 +6,7 @@
 #include <cmath>
 #include <tuple>
 namespace vllm_ascend {
+template<bool RETURN_SCORE = true>
 inline std::tuple<at::Tensor, at::Tensor> npu_indexer_region_score(
     const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
     const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
@@ -46,23 +47,61 @@ inline std::tuple<at::Tensor, at::Tensor> npu_indexer_region_score(
     TORCH_CHECK(regions >= 0 && regions <= MAX_REGIONS && regions <= table.size(1) * key.size(1) &&
         topK > 0 && topK <= MAX_TOP_K && regionSize > 0 && regionSize <= INT32_MAX &&
         std::isfinite(headScale) && std::isfinite(static_cast<float>(headScale)), "invalid scalar attributes");
-    auto scores = out.has_value() ? *out : at::empty({query.size(1), query.size(0), regions}, query.options().dtype(at::kFloat));
+    auto scores = !RETURN_SCORE ? at::Tensor{} : out.has_value() ? *out :
+        at::empty({query.size(1), query.size(0), regions}, query.options().dtype(at::kFloat));
     auto ids = selectedIds.has_value() ? *selectedIds :
         at::empty({query.size(1), query.size(0), topK}, query.options().dtype(at::kInt));
-    TORCH_CHECK(scores.dim() == 3 && scores.size(0) == query.size(1) && scores.size(1) == query.size(0) &&
+    TORCH_CHECK(!RETURN_SCORE || (scores.dim() == 3 && scores.size(0) == query.size(1) && scores.size(1) == query.size(0) &&
         scores.size(2) >= regions && scores.size(2) <= UINT32_MAX &&
-        scores.scalar_type() == at::kFloat, "out must be FP32 [G,T,R_out], R_out >= max_region_len");
+        scores.scalar_type() == at::kFloat), "out must be FP32 [G,T,R_out], R_out >= max_region_len");
     TORCH_CHECK(ids.dim() == 3 && ids.size(0) == query.size(1) && ids.size(1) == query.size(0) &&
         ids.size(2) == topK && ids.scalar_type() == at::kInt, "selected_region_ids must be INT32 [G,T,top_k]");
     for (const auto *output : {&scores, &ids}) {
+        if (!output->defined()) continue;
         TORCH_CHECK(output->device() == query.device(), "outputs must be on the input NPU");
         at::assert_no_internal_overlap(*output);
         for (const auto *input : inputs) at::assert_no_overlap(*output, *input);
     }
-    at::assert_no_overlap(scores, ids);
+    if (RETURN_SCORE) at::assert_no_overlap(scores, ids);
+    if (!RETURN_SCORE) {
+        const at::Tensor *contiguous[] = {&query, &weights, &lengths, &table, &cu, &ids};
+        for (const auto *tensor : contiguous) {
+            TORCH_CHECK(tensor->is_contiguous(), "TopK-only requires contiguous Q/weights/metadata/IDs");
+        }
+        constexpr int64_t ALIGNMENT = 32;
+        TORCH_CHECK(key.stride(3) == 1 && (key.size(1) == 1 || key.stride(1) == DIM) &&
+            key.stride(0) >= key.size(1) * DIM && key.stride(0) * key.element_size() % ALIGNMENT == 0 &&
+            key.storage_offset() * key.element_size() % ALIGNMENT == 0,
+            "TopK-only Key requires aligned page-inner-contiguous storage");
+        TORCH_CHECK(ids.storage_offset() % 8 == 0 && reinterpret_cast<uintptr_t>(ids.data_ptr()) % ALIGNMENT == 0,
+            "TopK-only selected_region_ids requires a 32-byte aligned storage base and view offset");
+    }
     const c10_npu::OptionalNPUGuard deviceGuard(query.device());
-    EXEC_NPU_CMD(aclnnVllmAscendIndexerRegionScore, query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, scores, ids);
+    if (RETURN_SCORE) {
+        EXEC_NPU_CMD(aclnnVllmAscendIndexerRegionScore, query, weights, key, lengths, table, cu,
+            regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, scores, ids);
+    } else {
+        EXEC_NPU_CMD(aclnnVllmAscendIndexerRegionScoreTopK, query, weights, key, lengths, table, cu,
+            regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, ids);
+    }
     return {scores, ids};
+}
+inline at::Tensor npu_indexer_region_score_topk_out(
+    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
+    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
+    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
+{
+    return std::get<1>(npu_indexer_region_score<false>(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, selectedIds));
+}
+inline at::Tensor npu_indexer_region_score_topk(
+    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
+    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
+    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode)
+{
+    return std::get<1>(npu_indexer_region_score<false>(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, c10::nullopt));
 }
 } // namespace vllm_ascend
