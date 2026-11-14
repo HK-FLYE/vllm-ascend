@@ -211,6 +211,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "situ_mx_quant"
         "grouped_matmul_situ_quant"
         "indexer_compress_epilog_v2"
+        "indexer_region_score"
         "attn_res_fwd"
         "chunk_fwd_o_vllm"
         "kda_gate_cumsum_vllm"
