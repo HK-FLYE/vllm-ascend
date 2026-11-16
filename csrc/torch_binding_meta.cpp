@@ -1774,13 +1774,11 @@ void hisparse_resolve_residency_meta(
     const std::optional<at::Tensor>&, const std::optional<at::Tensor>&, const std::optional<at::Tensor>&,
     int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) {}
 
-template<bool RETURN_SCORE = true>
-std::tuple<at::Tensor, at::Tensor> IndexerRegionScoreMeta(
+void npu_indexer_region_score_ids_out_meta(
     const at::Tensor &query, const at::Tensor &weights, const at::Tensor &keySummary,
     const at::Tensor &actualKvLengths, const at::Tensor &blockTable, const at::Tensor &cuSeqLens,
     int64_t maxRegionLen, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode,
-    const c10::optional<at::Tensor> &out, const c10::optional<at::Tensor> &selectedIds)
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
 {
     TORCH_CHECK(cacheMode == 1 && maskMode == 3 && sortMode == 1,
         "only cache_mode=1, mask_mode=3 and sort_mode=1 are supported");
@@ -1790,83 +1788,14 @@ std::tuple<at::Tensor, at::Tensor> IndexerRegionScoreMeta(
         "query must be [T,G,H,256], G=1 or a positive multiple of 4, H=4..128 in steps of 4");
     TORCH_CHECK(maxRegionLen >= 0 && maxRegionLen <= 16777216 && topK > 0 && topK <= 512 &&
         regionSize > 0, "invalid indexer_region_score attributes");
-    auto scores = !RETURN_SCORE ? at::Tensor{} : out.has_value() ? *out : at::empty_symint(
-        {query.sym_size(1), query.sym_size(0), maxRegionLen}, query.options().dtype(at::kFloat));
-    auto ids = selectedIds.has_value() ? *selectedIds : at::empty_symint(
-        {query.sym_size(1), query.sym_size(0), topK}, query.options().dtype(at::kInt));
-    TORCH_CHECK(!RETURN_SCORE || (scores.dim() == 3 && scores.sym_size(0) == query.sym_size(1) &&
-        scores.sym_size(1) == query.sym_size(0) && scores.sym_size(2) >= maxRegionLen &&
-        scores.scalar_type() == at::kFloat && scores.device() == query.device()),
-        "out must be FP32 [G,T,R_out], R_out >= max_region_len");
-    TORCH_CHECK(ids.dim() == 3 && ids.sym_size(0) == query.sym_size(1) && ids.sym_size(1) == query.sym_size(0) &&
-        ids.sym_size(2) == topK && ids.scalar_type() == at::kInt && ids.device() == query.device(),
+    TORCH_CHECK(selectedIds.dim() == 3 && selectedIds.sym_size(0) == query.sym_size(1) &&
+        selectedIds.sym_size(1) == query.sym_size(0) && selectedIds.sym_size(2) == topK &&
+        selectedIds.scalar_type() == at::kInt && selectedIds.device() == query.device(),
         "selected_region_ids must be INT32 [G,T,top_k] on the query device");
     const at::Tensor *inputs[] = {&weights, &keySummary, &actualKvLengths, &blockTable, &cuSeqLens};
     for (const auto *input : inputs) {
         TORCH_CHECK(input->device() == query.device(), "all inputs must be on the query device");
     }
-    return {scores, ids};
-}
-
-template<bool RETURN_SCORE>
-auto npu_indexer_region_score_meta(
-    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
-    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
-    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode)
-{
-    auto result = IndexerRegionScoreMeta<RETURN_SCORE>(query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, c10::nullopt);
-    if constexpr (RETURN_SCORE) return result;
-    else return std::get<1>(result);
-}
-void npu_indexer_region_score_ids_out_meta(
-    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
-    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
-    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
-{
-    (void)IndexerRegionScoreMeta<false>(query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, selectedIds);
-}
-
-void npu_indexer_region_score_out_meta(
-    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
-    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
-    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode,
-    const at::Tensor &out, const at::Tensor &selectedIds)
-{
-    (void)IndexerRegionScoreMeta<true>(query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, out, selectedIds);
-}
-
-// Mutating overloads lower to functional operators plus caller-buffer copies.
-void indexer_region_score_functionalize(const c10::OperatorHandle &op, c10::Stack *stack)
-{
-    constexpr size_t INPUT_COUNT = 13U, REGION_ARG = 6U, TOP_K_ARG = 7U;
-    const bool scores = op.schema().overload_name() == "out";
-    const size_t begin = stack->size() - INPUT_COUNT - (scores ? 2U : 1U);
-    auto query = (*stack)[begin].toTensor();
-    auto ids = stack->back().toTensor();
-    TORCH_CHECK(ids.dim() == 3 && ids.sym_size(0) == query.sym_size(1) &&
-        ids.sym_size(1) == query.sym_size(0) && ids.sym_size(2) == (*stack)[begin + TOP_K_ARG].toInt() &&
-        ids.scalar_type() == at::kInt && ids.device() == query.device(),
-        "selected_region_ids must be INT32 [G,T,top_k] on the query device");
-    at::Tensor out;
-    if (scores) {
-        out = (*stack)[begin + INPUT_COUNT].toTensor();
-        TORCH_CHECK(out.dim() == 3 && out.sym_size(0) == query.sym_size(1) &&
-            out.sym_size(1) == query.sym_size(0) && out.sym_size(2) >= (*stack)[begin + REGION_ARG].toInt() &&
-            out.scalar_type() == at::kFloat && out.device() == query.device(),
-            "out must be FP32 [G,T,R_out], R_out >= max_region_len");
-    }
-    c10::Stack functional(stack->begin() + begin, stack->begin() + begin + INPUT_COUNT);
-    c10::Dispatcher::singleton().findSchemaOrThrow("_C_ascend::npu_indexer_region_score", scores ? "score" : "")
-        .callBoxed(&functional);
-    if (scores) out.narrow(-1, 0, (*stack)[begin + REGION_ARG].toInt()).copy_(functional[0].toTensor());
-    ids.copy_(functional[scores ? 1U : 0U].toTensor());
-    stack->resize(begin);
 }
 
 } // namespace meta
@@ -1997,10 +1926,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // values, so the meta registration is a no-op.
     ops.impl("hisparse_resolve_residency", &vllm_ascend::meta::hisparse_resolve_residency_meta);
     // indexer_region_score
-    ops.impl("npu_indexer_region_score", &vllm_ascend::meta::npu_indexer_region_score_meta<false>);
-    ops.impl("npu_indexer_region_score.score", &vllm_ascend::meta::npu_indexer_region_score_meta<true>);
     ops.impl("npu_indexer_region_score.ids_out", &vllm_ascend::meta::npu_indexer_region_score_ids_out_meta);
-    ops.impl("npu_indexer_region_score.out", &vllm_ascend::meta::npu_indexer_region_score_out_meta);
 }
 }
+
 #endif

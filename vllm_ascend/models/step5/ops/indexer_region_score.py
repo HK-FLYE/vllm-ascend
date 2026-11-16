@@ -5,13 +5,10 @@ Wraps ``indexer_region_score`` from ops-transformer, which fuses region
 scoring, causal masking (mask_mode=3) and TopK selection with ascending
 logical-id sort (``top_k`` + ``sort_mode=1``) into a single operator call.
 
-The operator returns ``(scores [G,T,R], ids [G,T,top_k])`` and allocates
-the INT32 id output itself (ascending logical region ids, ``-1`` padded).
-With ``top_k > 0`` the causal path prunes K macros per request -- regions
-beyond a row's visible range are neither fetched nor scored nor written --
-so the masked score columns and the ``[max_region_len, R_out)`` tail are
-**unspecified**; only the visible candidates' scores are guaranteed and
-must be the only columns consumed as scores. The operator performs **no**
+This adapter returns only INT32 ids [G*T,top_k], using a preallocated
+output buffer (ascending logical region ids, ``-1`` padded).
+The causal path skips regions beyond each row's visible range and does
+not produce a dense score output. The operator performs **no**
 physical-page mapping, current-region append or metadata packing — those
 stay in the Triton pack kernels (``_decode_pack_kernel`` /
 ``_append_current_region_kernel``), whose ``ids [rows, topk]`` input
@@ -62,10 +59,7 @@ def indexer_score_topk(
     Returns:
         (ids [G*T, topk] int32) — ``ids`` rows hold logical region ids in
         ascending order with ``-1`` tail padding, the exact contract of
-        ``region_topk_ids`` / ``topk_select_new`` outputs. With ``top_k > 0``
-        only the causally visible score columns are defined (the operator
-        skips fetching/scoring/writing masked macros); masked and tail
-        columns must not be consumed as scores.
+        ``region_topk_ids`` / ``topk_select_new`` outputs.
     """
     tokens, groups = index_q.shape[:2]
     ids = index_q.new_empty((groups, tokens, topk), dtype=torch.int32)
@@ -83,7 +77,7 @@ def indexer_score_topk(
         cache_mode=1,
         mask_mode=3,
         sort_mode=1,
-        selected_region_ids=ids
+        selected_region_ids=ids,
     )
 
     return ids.reshape(groups * tokens, topk)

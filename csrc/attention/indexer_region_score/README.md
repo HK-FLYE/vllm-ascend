@@ -9,7 +9,7 @@ Key summaries are shared by all query groups.
 ```python
 import torch
 
-selected_region_ids = index_q.new_empty((query.shape[1], query.shape[0], 512), dtype=torch.int32)
+selected_region_ids = query.new_empty((query.shape[1], query.shape[0], 512), dtype=torch.int32)
 torch.ops._C_ascend.npu_indexer_region_score.ids_out(
     query,                    # [T, G, H, 256]
     weights,                  # [T, G, H]
@@ -27,48 +27,30 @@ torch.ops._C_ascend.npu_indexer_region_score.ids_out(
 )
 ```
 
-Omitting `out`, or passing `out=None`, returns only IDs and does not allocate
-a dense score output. `region_ids` is INT32
-`[G, T, top_k]` and contains logical region IDs in ascending order. IDs are
+The only Torch entry point is
+`torch.ops._C_ascend.npu_indexer_region_score.ids_out`. It requires the
+caller to preallocate `selected_region_ids`, writes that buffer in place,
+and returns `None`. The buffer must be INT32 `[G, T, top_k]` on the same
+NPU as the inputs. The Torch adapter does not allocate a score or IDs
+output and always disables the native dense score output.
+
+The buffer contains logical region IDs in ascending order. IDs are
 selected by descending score, with the smaller logical ID winning ties.
 Unused slots contain `-1`. These IDs do not include physical page mapping,
 the current region, or downstream packing.
 `top_k` is in `[1, 512]`. Selection assumes finite FP32 scores.
 
-To also produce FP32 scores, supply an output buffer to the same API:
+Inputs and the IDs buffer may be noncontiguous or unaligned. ACLNN converts
+inputs as needed and copies results back into the caller's output view.
+Aligned paged cache views with contiguous page contents, gaps between
+pages, and nonzero layer offsets retain zero-copy access; other key
+layouts are materialized. The IDs buffer must not overlap internally or
+with any input.
 
-```python
-score_buffer = query.new_empty(
-    (query.shape[1], query.shape[0], 8192), dtype=torch.float32,
-)
-scores, region_ids = indexer_region_score(
-    query, weights, key_summary, actual_kv_lengths, block_table, cu_seq_lens,
-    max_region_len=8192, top_k=512, out=score_buffer,
-)
-```
-
-Here `scores` is the supplied FP32 `[G,T,R_out]` buffer, with
-`R_out >= max_region_len`. An optional INT32 `selected_region_ids` buffer
-is reused in either mode. The wrapper returns the caller's output buffers.
-
-The dispatcher has one name, `_C_ascend.npu_indexer_region_score`, with
-fixed-return overloads for graph capture: the default returns IDs, `.score`
-returns newly allocated `(scores, ids)`, and `.ids_out`/`.out` write supplied
-buffers and return nothing. The Python wrapper returns those supplied buffers.
-Score `out` accepts `R_out >= R` and noncontiguous views in eager,
-compiled and functionalized execution. The graph paths copy the R-wide
-functional score prefix into the caller's output capacity.
-
-Both modes accept noncontiguous or unaligned inputs and output views.
-ACLNN converts inputs as needed and copies results back into the caller's
-output views. Aligned
-paged cache views with contiguous page contents, gaps between pages, and
-nonzero layer offsets retain zero-copy access; other key layouts are
-materialized.
-Output views must not overlap internally, with inputs, or with each other.
-
-Both modes use the same scoring, causal visibility, tie breaking, ID ordering
-and padding. This matches the source bf16 interface selected by `out`.
+The mutating schema and allocation-free Meta implementation describe the
+caller-owned IDs output for tracing. Standard `torch.compile` and
+NPUGraph compatibility require end-to-end validation on the target NPU
+and software stack.
 
 IDs-only execution uses a fixed **256 MiB IRS algorithm workspace limit**,
 including its CANN library prefix, intrinsic auxiliary storage and alignment
@@ -91,7 +73,9 @@ IDs-only execution does not allocate a dense score output.
 
 At the native layer, passing `output=nullptr` to
 `aclnnIndexerRegionScoreGetWorkspaceSize` selects the same bounded
-path. Both modes use this single native entry point.
+IDs-only path. The native ACLNN entry point still supports its original
+optional dense score output when a score buffer is supplied; that
+capability is not exposed by the Torch registration.
 The internal GE score slot has shape `[0]` when disabled. No public workspace
 budget parameter is added. The migrated scope remains D=256, K<=512 and
 cache/mask/sort modes 1/3/1.
@@ -101,19 +85,20 @@ For query token `j` within request `n`, the visible historical region count is
 0, max_region_len)`. For each visible region, the score is
 `sum_h(weights[t, g, h] * head_scale * relu(dot(query[t, g, h], key[n, r])))`
 for each query group `g`.
-Only visible scores are defined. Masked columns and extra output capacity
-must not be read as candidates.
+Only causally visible regions compete for the selected IDs. For native
+ACLNN callers requesting scores, only visible score columns are defined;
+masked columns and extra output capacity must not be read as candidates.
 
 The mode parameters remain public, with defaults `cache_mode=1`,
 `mask_mode=3`, and `sort_mode=1`. Only this combination is currently
 supported; other values are rejected. Continuous keys, D=128, other
 masks, and score-ordered output are omitted. The
-Python interface exposes the operator for models that already produce paged
+Torch entry point exposes the operator for models that already produce paged
 key summaries; existing quantized lightning-indexer calls use a different
 data contract.
 
 Build the native operator with the repository's CANN build, then rebuild the
-Torch extension to register `_C_ascend.npu_indexer_region_score`:
+Torch extension to register `_C_ascend.npu_indexer_region_score.ids_out`:
 
 ```bash
 bash csrc/build.sh --pkg --soc=ascend950 --ops=indexer_region_score -j8 -O3
@@ -139,5 +124,11 @@ and are historical reference data. A performance comparison for this migration
 must measure both implementations with logical-ID ordering, the same inputs,
 and the complete score-and-selection kernel sequence.
 
-See [validation results](VALIDATION.md) for the compiled configurations,
-precision coverage and matched model-case measurements.
+The [single-operator tests](../../../tests/e2e/nightly/single_node/ops/singlecard_ops/test_indexer_region_score.py)
+call `.ids_out` with preallocated INT32 IDs buffers and compare the resulting
+IDs exactly against a CPU mathematical golden reference. After building and
+loading the operator environment, run from the repository root on Ascend A5 (950):
+
+```bash
+pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_indexer_region_score.py
+```

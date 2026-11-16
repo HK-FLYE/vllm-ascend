@@ -4,15 +4,12 @@
 #include <ATen/ATen.h>
 #include <ATen/MemoryOverlap.h>
 #include <cmath>
-#include <tuple>
 namespace vllm_ascend {
-template<bool RETURN_SCORE = true>
-inline std::tuple<at::Tensor, at::Tensor> IndexerRegionScore(
+inline void npu_indexer_region_score_ids_out(
     const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
     const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
     int64_t regions, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode,
-    const c10::optional<at::Tensor> &out, const c10::optional<at::Tensor> &selectedIds)
+    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
 {
     constexpr int64_t MIN_HEADS = 4, MAX_HEADS = 128, DIM = 256, MAX_REGIONS = 16777216, MAX_TOP_K = 512;
     TORCH_CHECK(query.device().is_privateuseone(), "indexer_region_score expects NPU inputs");
@@ -47,56 +44,15 @@ inline std::tuple<at::Tensor, at::Tensor> IndexerRegionScore(
     TORCH_CHECK(regions >= 0 && regions <= MAX_REGIONS && regions <= table.size(1) * key.size(1) &&
         topK > 0 && topK <= MAX_TOP_K && regionSize > 0 && regionSize <= INT32_MAX &&
         std::isfinite(headScale) && std::isfinite(static_cast<float>(headScale)), "invalid scalar attributes");
-    auto scores = !RETURN_SCORE ? at::Tensor{} : out.has_value() ? *out :
-        at::empty({query.size(1), query.size(0), regions}, query.options().dtype(at::kFloat));
-    auto ids = selectedIds.has_value() ? *selectedIds :
-        at::empty({query.size(1), query.size(0), topK}, query.options().dtype(at::kInt));
-    TORCH_CHECK(!RETURN_SCORE || (scores.dim() == 3 && scores.size(0) == query.size(1) && scores.size(1) == query.size(0) &&
-        scores.size(2) >= regions && scores.size(2) <= UINT32_MAX &&
-        scores.scalar_type() == at::kFloat), "out must be FP32 [G,T,R_out], R_out >= max_region_len");
-    TORCH_CHECK(ids.dim() == 3 && ids.size(0) == query.size(1) && ids.size(1) == query.size(0) &&
-        ids.size(2) == topK && ids.scalar_type() == at::kInt, "selected_region_ids must be INT32 [G,T,top_k]");
-    for (const auto *output : {&scores, &ids}) {
-        if (!output->defined()) continue;
-        TORCH_CHECK(output->device() == query.device(), "outputs must be on the input NPU");
-        at::assert_no_internal_overlap(*output);
-        for (const auto *input : inputs) at::assert_no_overlap(*output, *input);
-    }
-    if (RETURN_SCORE) at::assert_no_overlap(scores, ids);
+    TORCH_CHECK(selectedIds.dim() == 3 && selectedIds.size(0) == query.size(1) &&
+        selectedIds.size(1) == query.size(0) && selectedIds.size(2) == topK &&
+        selectedIds.scalar_type() == at::kInt, "selected_region_ids must be INT32 [G,T,top_k]");
+    TORCH_CHECK(selectedIds.device() == query.device(), "selected_region_ids must be on the input NPU");
+    at::assert_no_internal_overlap(selectedIds);
+    for (const auto *input : inputs) at::assert_no_overlap(selectedIds, *input);
     const c10_npu::OptionalNPUGuard deviceGuard(query.device());
-    const c10::optional<at::Tensor> scoreOutput = RETURN_SCORE ? c10::optional<at::Tensor>(scores) : c10::nullopt;
+    const c10::optional<at::Tensor> scoreOutput = c10::nullopt;
     EXEC_NPU_CMD(aclnnIndexerRegionScore, query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, scoreOutput, ids);
-    return {scores, ids};
-}
-template<bool RETURN_SCORE>
-inline auto npu_indexer_region_score(
-    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
-    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
-    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode)
-{
-    auto result = IndexerRegionScore<RETURN_SCORE>(query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, c10::nullopt);
-    if constexpr (RETURN_SCORE) return result;
-    else return std::get<1>(result);
-}
-inline void npu_indexer_region_score_ids_out(
-    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
-    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
-    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
-{
-    (void)IndexerRegionScore<false>(query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, c10::nullopt, selectedIds);
-}
-inline void npu_indexer_region_score_out(
-    const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
-    const at::Tensor &lengths, const at::Tensor &table, const at::Tensor &cu,
-    int64_t regions, int64_t topK, int64_t regionSize, double headScale,
-    int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &out, const at::Tensor &selectedIds)
-{
-    (void)IndexerRegionScore<true>(query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, out, selectedIds);
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, scoreOutput, selectedIds);
 }
 } // namespace vllm_ascend
