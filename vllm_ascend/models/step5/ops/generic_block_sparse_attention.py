@@ -48,7 +48,6 @@ from cann_ops_transformer.ops.attention.generic_block_sparse_attention import (
 
 from vllm_ascend.ops.triton.step5.summary_update import append_current_region
 
-
 _SPARSE_PATTERN_PER_GROUP_PER_TOKEN = 4
 _MASK_CAUSAL = 1
 _QUANT_NONE = 0

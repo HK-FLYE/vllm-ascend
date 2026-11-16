@@ -66,8 +66,8 @@ from vllm_ascend.ops.triton.step5.summary_update import (
 from vllm_ascend.utils import vllm_version_is
 
 if vllm_version_is("0.33.0"):
-    from vllm.models.step5.nvidia.csa_tail_ring import Step5CSATailRing
-    from vllm.models.step5.nvidia.sparse_summary_cache import (
+    from vllm.models.step5.nvidia.csa_tail_ring import Step5CSATailRing # type: ignore[import-not-found]
+    from vllm.models.step5.nvidia.sparse_summary_cache import ( # type: ignore[import-not-found]
         Step5SparseSummaryBackend,
         Step5SparseSummaryCacheLayer,
         Step5SparseSummaryMetadataBuilder,
@@ -768,7 +768,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         cu_seq_lens = torch.arange(n + 1, device=index_q.device, dtype=torch.int32)
         positions = seq_lens_i32.to(torch.int64) - 1
         actual_kv_lengths = seq_lens_i32
-        _scores, ids = indexer_score_topk(
+        ids = indexer_score_topk(
             index_q[:n],
             weights[:n],
             self.summary_cache.mean.view(torch.float8_e4m3fn).unsqueeze(2),
@@ -833,7 +833,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         cu_seqlens_q = md.query_start_loc_int64[: num_decodes + 1]
         actual_kv_lengths = seq_lens
         summary_md = self._summary_metadata()
-        _scores, ids = indexer_score_topk(
+        ids = indexer_score_topk(
             index_q[:total_tokens],
             weights[:total_tokens],
             self.summary_cache.mean.view(torch.float8_e4m3fn).unsqueeze(2),
@@ -905,7 +905,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         )
         actual_kv_lengths = p.seq_lens[:num_reqs].to(torch.int32)
         summary_md = self._summary_metadata()
-        _scores, ids = indexer_score_topk(
+        ids = indexer_score_topk(
             index_q[:num_query_tokens],
             weights[:num_query_tokens],
             self.summary_cache.mean.view(torch.float8_e4m3fn).unsqueeze(2),

@@ -52,7 +52,7 @@
 
 - `ids` rows must be ascending with `-1` only as tail padding (the
   `IndexerRegionScore` `sort_mode=1` contract); `live` would be
-  mis-computed otherwise (any `-1` counts as dead).
+  miss-computed otherwise (any `-1` counts as dead).
 - The selection pool must be strictly below `floor(position / region_size)`
   (guaranteed by the fused indexer's causal top-k) — otherwise the appended
   current region could break the row's ascending order.
