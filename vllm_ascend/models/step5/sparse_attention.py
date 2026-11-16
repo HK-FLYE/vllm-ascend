@@ -768,7 +768,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         cu_seq_lens = torch.arange(n + 1, device=index_q.device, dtype=torch.int32)
         positions = seq_lens_i32.to(torch.int64) - 1
         actual_kv_lengths = seq_lens_i32
-        _scores, ids = indexer_score_topk(
+        ids = indexer_score_topk(
             index_q[:n],
             weights[:n],
             self.summary_cache.mean.view(torch.float8_e4m3fn).unsqueeze(2),
@@ -833,7 +833,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         cu_seqlens_q = md.query_start_loc_int64[: num_decodes + 1]
         actual_kv_lengths = seq_lens
         summary_md = self._summary_metadata()
-        _scores, ids = indexer_score_topk(
+        ids = indexer_score_topk(
             index_q[:total_tokens],
             weights[:total_tokens],
             self.summary_cache.mean.view(torch.float8_e4m3fn).unsqueeze(2),
@@ -905,7 +905,7 @@ class AscendStep5DSAImpl(AttentionImplBase[AscendStep5DSAMetadata]):
         )
         actual_kv_lengths = p.seq_lens[:num_reqs].to(torch.int32)
         summary_md = self._summary_metadata()
-        _scores, ids = indexer_score_topk(
+        ids = indexer_score_topk(
             index_q[:num_query_tokens],
             weights[:num_query_tokens],
             self.summary_cache.mean.view(torch.float8_e4m3fn).unsqueeze(2),
