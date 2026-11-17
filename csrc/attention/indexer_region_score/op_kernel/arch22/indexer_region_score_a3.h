@@ -33,6 +33,20 @@ public:
         if (data_.batchTokens != 0) {
             scores_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(userWorkspace + data_.scorePoolOffset));
         }
+        // Metadata belongs to this invocation only; every Init reloads it.
+        singleRequestCached_ = BatchedVector() && data_.numRequests == 1U;
+        singleRegionPower2_ = false;
+        singleRegionShift_ = 0;
+        if (singleRequestCached_) {
+            singleBegin_ = cu_.GetValue(0);
+            singleEnd_ = cu_.GetValue(1);
+            singleLength_ = lengths_.GetValue(0);
+            const uint32_t region = data_.regionSize;
+            singleRegionPower2_ = region != 0U && (region & (region - 1U)) == 0U;
+            if (singleRegionPower2_) {
+                for (uint32_t value = region; value > 1U; value >>= 1U) ++singleRegionShift_;
+            }
+        }
         core_ = GetBlockIdx();
         if ASCEND_IS_AIV {
             core_ /= 2;
@@ -74,12 +88,19 @@ private:
     {
         visible = 0;
         for (uint32_t n = 0; n < data_.numRequests; ++n) {
-            const int32_t begin = cu_.GetValue(n), end = cu_.GetValue(n + 1);
+            const int32_t begin = singleRequestCached_ ? singleBegin_ : cu_.GetValue(n);
+            const int32_t end = singleRequestCached_ ? singleEnd_ : cu_.GetValue(n + 1);
             if (begin < 0 || end < begin || static_cast<uint32_t>(end) > data_.totalTokens) continue;
             if (token >= static_cast<uint32_t>(begin) && token < static_cast<uint32_t>(end)) {
                 request = n;
-                const int64_t position = static_cast<int64_t>(lengths_.GetValue(n)) - (end - begin) + token - begin;
-                if (position > 0) visible = Min(static_cast<uint32_t>(position / data_.regionSize), data_.seqK);
+                const int32_t length = singleRequestCached_ ? singleLength_ : lengths_.GetValue(n);
+                const int64_t position = static_cast<int64_t>(length) - (end - begin) + token - begin;
+                if (position > 0) {
+                    const uint64_t quotient = singleRegionPower2_ ?
+                        (static_cast<uint64_t>(position) >> singleRegionShift_) :
+                        static_cast<uint64_t>(position / data_.regionSize);
+                    visible = Min(static_cast<uint32_t>(quotient), data_.seqK);
+                }
                 return true;
             }
         }
@@ -126,12 +147,39 @@ private:
         SetFlag<HardEvent::FIX_M>(0);
     }
 
+    __aicore__ inline bool BatchedVector() const
+    {
+        return data_.batchTokens != 0 && data_.headsPerGroup == 4;
+    }
+
+    __aicore__ inline void CacheBundleWeights(uint32_t group, uint32_t token, uint32_t queries)
+    {
+        for (uint32_t q = 0; q < queries; ++q) {
+            for (uint32_t head = 0; head < 4; ++head) {
+                Duplicate(weight_[(q * 4 + head) * kVectorColumns], Weight(group, token + q, head), kVectorColumns);
+            }
+        }
+        PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void ReduceBundle(uint32_t queries)
+    {
+        BinaryRepeatParams repeats{1, 1, 1, 8, 32, 32};
+        Mul(acc_, dots_, weight_, uint64_t(kVectorColumns), uint8_t(queries), repeats);
+        PipeBarrier<PIPE_V>();
+        for (uint32_t head = 1; head < 4; ++head) {
+            MulAddDst(acc_, dots_[head * kVectorColumns], weight_[head * kVectorColumns],
+                uint64_t(kVectorColumns), uint8_t(queries), repeats);
+            PipeBarrier<PIPE_V>();
+        }
+    }
+
     __aicore__ inline void InitVector()
     {
         pipe_->InitBuffer(dotBuffer_, kHeadCapacity * kVectorColumns * sizeof(float));
-        pipe_->InitBuffer(accBuffer_, kVectorColumns * sizeof(float));
+        pipe_->InitBuffer(accBuffer_, (BatchedVector() ? 32U : 1U) * kVectorColumns * sizeof(float));
         pipe_->InitBuffer(partBuffer_, kVectorColumns * sizeof(float));
-        pipe_->InitBuffer(weightBuffer_, kVectorColumns * sizeof(float));
+        pipe_->InitBuffer(weightBuffer_, (BatchedVector() ? 128U : 1U) * kVectorColumns * sizeof(float));
         pipe_->InitBuffer(windowBuffer_, kSelectionWindow * sizeof(float));
         pipe_->InitBuffer(heapScoreBuffer_, kMaxTopK * sizeof(float));
         pipe_->InitBuffer(heapIdBuffer_, kMaxTopK * sizeof(int32_t));
@@ -170,26 +218,30 @@ private:
     }
 
     __aicore__ inline void LoadCubeTile(uint32_t group, uint32_t token,
-        uint32_t request, uint32_t regionStart, uint32_t count, uint32_t queries, bool linear)
+        uint32_t request, uint32_t regionStart, uint32_t count, uint32_t queries, bool linear, bool loadQuery)
     {
         WaitFlag<HardEvent::M_MTE2>(0);
         const uint32_t m = Align16(data_.headsPerGroup * queries);
-        InitConstValueParams<uint16_t> clearQ(1, static_cast<uint16_t>(m * kDimension / 16), 0, 0);
+        if (loadQuery) {
+            InitConstValueParams<uint16_t> clearQ(1, static_cast<uint16_t>(m * kDimension / 16), 0, 0);
+            InitConstValue(qL1_.ReinterpretCast<uint16_t>(), clearQ);
+        }
         InitConstValueParams<uint16_t> clearK(1, static_cast<uint16_t>(kRegionTile * kDimension / 16), 0, 0);
-        InitConstValue(qL1_.ReinterpretCast<uint16_t>(), clearQ);
         InitConstValue(kL1_.ReinterpretCast<uint16_t>(), clearK);
         PipeBarrier<PIPE_MTE2>();
-        Nd2NzParams qCopy{};
-        qCopy.ndNum = 1;
-        qCopy.nValue = data_.headsPerGroup;
-        qCopy.dValue = kDimension;
-        qCopy.srcDValue = kDimension;
-        qCopy.dstNzC0Stride = m;
-        qCopy.dstNzNStride = 1;
-        for (uint32_t q = 0; q < queries; ++q) {
-            DataCopy(qL1_[q * data_.headsPerGroup * 16], query_[
-                static_cast<uint64_t>(token + q) * data_.qStrideToken +
-                static_cast<uint64_t>(group) * data_.qStrideGroup], qCopy);
+        if (loadQuery) {
+            Nd2NzParams qCopy{};
+            qCopy.ndNum = 1;
+            qCopy.nValue = data_.headsPerGroup;
+            qCopy.dValue = kDimension;
+            qCopy.srcDValue = kDimension;
+            qCopy.dstNzC0Stride = m;
+            qCopy.dstNzNStride = 1;
+            for (uint32_t q = 0; q < queries; ++q) {
+                DataCopy(qL1_[q * data_.headsPerGroup * 16], query_[
+                    static_cast<uint64_t>(token + q) * data_.qStrideToken +
+                    static_cast<uint64_t>(group) * data_.qStrideGroup], qCopy);
+            }
         }
         // Key rows are paged. Adjacent physical rows share one ND-to-NZ copy.
         Nd2NzParams keyCopy{};
@@ -235,12 +287,14 @@ private:
         }
         SetFlag<HardEvent::MTE2_MTE1>(0);
         WaitFlag<HardEvent::MTE2_MTE1>(0);
-        LoadData2DParams loadQ{};
-        loadQ.repeatTimes = kDimension / 16;
-        loadQ.srcStride = m / 16;
-        loadQ.ifTranspose = false;
-        for (uint32_t block = 0; block < m / 16; ++block) {
-            LoadData(qL0_[block * kDimension * 16], qL1_[block * 256], loadQ);
+        if (loadQuery) {
+            LoadData2DParams loadQ{};
+            loadQ.repeatTimes = kDimension / 16;
+            loadQ.srcStride = m / 16;
+            loadQ.ifTranspose = false;
+            for (uint32_t block = 0; block < m / 16; ++block) {
+                LoadData(qL0_[block * kDimension * 16], qL1_[block * 256], loadQ);
+            }
         }
         LoadData2DParams loadK{};
         loadK.repeatTimes = kRegionTile * kDimension / 256;
@@ -255,7 +309,7 @@ private:
     // request boundaries; each segment shares its request's paged key.
     __aicore__ inline uint32_t BundleWidth() const
     {
-        return data_.headsPerGroup == 4 ? 4 : 1;
+        return data_.headsPerGroup == 4 ? (data_.batchTokens != 0 ? 32U : 4U) : 1U;
     }
 
     __aicore__ inline uint32_t Segment(uint32_t token, uint32_t limit,
@@ -285,10 +339,16 @@ private:
                 uint32_t request = 0, visible = 0;
                 if (!Request(token, request, visible)) { ++q; continue; }
                 const uint32_t queries = Segment(token, count - q, request, visible);
+                // IDs-only selects every visible region in this bundle.
+                // Match producer/consumer skipping; keep final flag credits intact.
+                if (data_.batchTokens != 0 && visible <= (data_.selectionConfig & 0xFFFFU)) {
+                    q += queries;
+                    continue;
+                }
                 const uint32_t m = Align16(data_.headsPerGroup * queries);
                 const bool linear = ContiguousKey(request, visible);
                 for (uint32_t r = 0; r < visible; r += kRegionTile) {
-                    LoadCubeTile(group, token, request, r, Min(kRegionTile, visible - r), queries, linear);
+                    LoadCubeTile(group, token, request, r, Min(kRegionTile, visible - r), queries, linear, !BatchedVector() || r == 0);
                     WaitFlag<HardEvent::FIX_M>(0);
                     MmadParams mm{};
                     mm.m = m;
@@ -352,7 +412,15 @@ private:
                 const uint32_t token = data_.batchBegin + first + q;
                 uint32_t request = 0, visible = 0;
                 if (!Request(token, request, visible)) { ++q; continue; }
+                const uint32_t firstVisible = visible;
                 const uint32_t queries = Segment(token, count - q, request, visible);
+                // IDs-only selects every visible region in this bundle.
+                // Match producer/consumer skipping; keep final flag credits intact.
+                if (data_.batchTokens != 0 && visible <= (data_.selectionConfig & 0xFFFFU)) {
+                    q += queries;
+                    continue;
+                }
+                if (BatchedVector()) CacheBundleWeights(group, token, queries);
                 for (uint32_t r = 0; r < visible; r += kRegionTile) {
                     CrossCoreWaitFlag(kReady);
                     DataCopyParams copy{};
@@ -363,20 +431,33 @@ private:
                     SetFlag<HardEvent::MTE2_V>(0);
                     WaitFlag<HardEvent::MTE2_V>(0);
                     CrossCoreSetFlag<2, PIPE_MTE2>(kFree);
+                    if (BatchedVector()) ReduceBundle(queries);
+                    const uint32_t batchStart = r + sub_ * kVectorColumns;
+                    if (BatchedVector() && batchStart < firstVisible &&
+                        firstVisible - batchStart >= kVectorColumns && data_.outputStrideToken <= UINT32_MAX / 4U) {
+                        SetFlag<HardEvent::V_MTE3>(0);
+                        WaitFlag<HardEvent::V_MTE3>(0);
+                        DataCopyExtParams store{static_cast<uint16_t>(queries), kVectorColumns * 4U, 0,
+                            static_cast<uint32_t>(data_.outputStrideToken * 4U - kVectorColumns * 4U), 0};
+                        DataCopyPad(scores_[ScoreBase(group, token) + batchStart], acc_, store);
+                        SetFlag<HardEvent::MTE3_V>(0);
+                        WaitFlag<HardEvent::MTE3_V>(0);
+                    } else {
                     for (uint32_t item = 0; item < queries; ++item) {
                         uint32_t itemRequest = 0, itemVisible = 0;
                         (void)Request(token + item, itemRequest, itemVisible);
-                        Reduce(group, token + item, item * data_.headsPerGroup);
+                        if (!BatchedVector()) Reduce(group, token + item, item * data_.headsPerGroup);
                         const uint32_t start = r + sub_ * kVectorColumns;
                         if (start < itemVisible) {
                             const uint32_t length = Min(kVectorColumns, itemVisible - start);
                             SetFlag<HardEvent::V_MTE3>(0);
                             WaitFlag<HardEvent::V_MTE3>(0);
                             DataCopyExtParams store{1, length * 4U, 0, 0, 0};
-                            DataCopyPad(scores_[ScoreBase(group, token + item) + start], acc_, store);
+                            DataCopyPad(scores_[ScoreBase(group, token + item) + start], acc_[BatchedVector() ? item * kVectorColumns : 0], store);
                             SetFlag<HardEvent::MTE3_V>(0);
                             WaitFlag<HardEvent::MTE3_V>(0);
                         }
+                    }
                     }
                     SetFlag<HardEvent::V_MTE2>(0);
                     WaitFlag<HardEvent::V_MTE2>(0);
@@ -513,6 +594,21 @@ private:
         SetFlag<HardEvent::V_S>(0);
         WaitFlag<HardEvent::V_S>(0);
         const float threshold = ordered.GetValue(k - 1);
+        // Strict boundary proves membership even when selected scores contain ties.
+        // Exact cutoff ties retain the original stable logical-ID tie path.
+        if (data_.batchTokens != 0 && data_.headsPerGroup == 4 && visible > k && threshold > ordered.GetValue(k)) {
+            auto directIds = index.ReinterpretCast<int32_t>();
+            auto directMask = dots_.ReinterpretCast<uint8_t>()[0];
+            CreateVecIndex(directIds, int32_t(0), aligned);
+            CompareScalar(directMask, window_, threshold, CMPMODE::GE, aligned);
+            PipeBarrier<PIPE_V>();
+            uint64_t directCount = 0;
+            GatherMask(heapIds_, directIds, directMask.ReinterpretCast<uint32_t>(),
+                true, visible, {1, 1, 8, 1}, directCount);
+            SetFlag<HardEvent::V_S>(0);
+            WaitFlag<HardEvent::V_S>(0);
+            return static_cast<uint32_t>(directCount);
+        }
         // Find the first tie by binary search; the hardware sort's tie order
         // is irrelevant because only the threshold value is used.
         uint32_t lo = 0, hi = k;
@@ -619,6 +715,9 @@ private:
     PagedTilingData data_{};
     TPipe *pipe_ = nullptr;
     uint32_t core_ = 0, sub_ = 0;
+    bool singleRequestCached_ = false, singleRegionPower2_ = false;
+    uint32_t singleRegionShift_ = 0;
+    int32_t singleBegin_ = 0, singleEnd_ = 0, singleLength_ = 0;
     bool reverseHeap_ = false;
     uint32_t cachedRequest_ = 0xFFFFFFFFU, cachedPrefix_ = 0;
     int32_t cachedFirstPage_ = 0;
