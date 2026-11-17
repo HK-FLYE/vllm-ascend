@@ -80,6 +80,36 @@ private:
     static constexpr uint16_t kReady = 0;
     static constexpr uint16_t kFree = 1;
     static constexpr uint32_t kSelectionWindow = 4096;
+    // One H4 IDs-only UB arena; byte aliases follow the frozen round7 contract.
+    static constexpr uint32_t kArenaBytes = 153600;
+    static constexpr uint32_t kBatchRows = 4;
+    static constexpr uint32_t kBatchColumns = 640;
+    static constexpr uint32_t kBatchInputElements = 2560;
+    static constexpr uint32_t kBatchPackedElements = 5120;
+    static constexpr uint32_t kBatchPackedRowWords = 1280;
+    static constexpr uint32_t kBatchRowBytes = 2560;
+    static constexpr uint32_t kBatchOutputRowBytes = 2048;
+    static constexpr uint32_t kBatchInputOffset = 0;
+    static constexpr uint32_t kBatchPackedAOffset = 10240;
+    static constexpr uint32_t kBatchPackedBOffset = 30720;
+    static constexpr uint32_t kBatchIndexOffset = 51200;
+    static constexpr uint32_t kBatchOrderedOffset = 61440;
+    static constexpr uint32_t kBatchOutputOffset = 71680;
+    static constexpr uint32_t kBatchLogicalOffset = 79872;
+    static constexpr uint32_t kBatchWideOffset = 82432;
+    static constexpr uint32_t kBatchFloatIdsOffset = 84992;
+    static constexpr uint32_t kBatchGreaterOffset = 87552;
+    static constexpr uint32_t kBatchEqualOffset = 87808;
+    static constexpr uint32_t kBatchCutoffOffset = 88064;
+    // Scoring lifetime aliases; batch selection starts after global SyncAll.
+    static constexpr uint32_t kArenaDotsOffset = 0, kArenaDotsElements = 8192;
+    static constexpr uint32_t kArenaAccOffset = 32768, kArenaAccElements = 2048;
+    static constexpr uint32_t kArenaPartialOffset = 40960, kArenaPartialElements = 64;
+    static constexpr uint32_t kArenaWeightOffset = 41216, kArenaWeightElements = 8192;
+    static constexpr uint32_t kArenaWindowOffset = 73984, kArenaWindowElements = 4096;
+    static constexpr uint32_t kArenaHeapScoreOffset = 90368, kArenaHeapElements = 512;
+    static constexpr uint32_t kArenaHeapIdsOffset = 92416;
+
 
     __aicore__ inline uint32_t Min(uint32_t a, uint32_t b) const { return a < b ? a : b; }
     __aicore__ inline uint32_t Align16(uint32_t n) const { return (n + 15U) / 16U * 16U; }
@@ -176,6 +206,19 @@ private:
 
     __aicore__ inline void InitVector()
     {
+        if (BatchedVector()) {
+            pipe_->InitBuffer(batchArenaBuffer_, kArenaBytes);
+            batchArena_ = batchArenaBuffer_.Get<uint8_t>();
+            batchArena_.SetSize(kArenaBytes);
+            dots_ = BatchView<float>(kArenaDotsOffset, kArenaDotsElements);
+            acc_ = BatchView<float>(kArenaAccOffset, kArenaAccElements);
+            partial_ = BatchView<float>(kArenaPartialOffset, kArenaPartialElements);
+            weight_ = BatchView<float>(kArenaWeightOffset, kArenaWeightElements);
+            window_ = BatchView<float>(kArenaWindowOffset, kArenaWindowElements);
+            heapScores_ = BatchView<float>(kArenaHeapScoreOffset, kArenaHeapElements);
+            heapIds_ = BatchView<int32_t>(kArenaHeapIdsOffset, kArenaHeapElements);
+            return;
+        }
         pipe_->InitBuffer(dotBuffer_, kHeadCapacity * kVectorColumns * sizeof(float));
         pipe_->InitBuffer(accBuffer_, (BatchedVector() ? 32U : 1U) * kVectorColumns * sizeof(float));
         pipe_->InitBuffer(partBuffer_, kVectorColumns * sizeof(float));
@@ -656,7 +699,16 @@ private:
         const uint32_t k = data_.selectionConfig & 0xFFFFU;
         const uint32_t rows = data_.groups * data_.batchCount;
         const uint32_t vectorCore = GetBlockIdx();
-        for (uint32_t row = vectorCore; row < rows; row += data_.usedCubeCores * 2) {
+        const uint32_t stride = data_.usedCubeCores * 2U;
+        for (uint32_t row = vectorCore; row < rows;) {
+            if (BatchedVector() && k == 512U && TrySelectTwelveRows(row)) {
+                row += kLargeRows * stride;
+                continue;
+            }
+            if (BatchedVector() && k == 512U && TrySelectFourRows(row)) {
+                row += 4U * stride;
+                continue;
+            }
             const uint32_t group = row / data_.batchCount;
             const uint32_t token = data_.batchBegin + row % data_.batchCount;
             uint32_t request = 0, visible = 0;
@@ -709,8 +761,325 @@ private:
             DataCopyPad(ids_[out], heapIds_, copy);
             SetFlag<HardEvent::MTE3_S>(0);
             WaitFlag<HardEvent::MTE3_S>(0);
+            row += stride;
         }
     }
+
+    template <typename T>
+    __aicore__ inline LocalTensor<T> BatchView(uint32_t bytes, uint32_t count)
+    {
+        auto tensor = batchArena_.ReinterpretCast<T>()[bytes / sizeof(T)];
+        tensor.SetSize(count);
+        return tensor;
+    }
+
+    __aicore__ inline void SortFourRows()
+    {
+        auto input = BatchView<float>(kBatchInputOffset, kBatchInputElements);
+        auto a = BatchView<float>(kBatchPackedAOffset, kBatchPackedElements);
+        auto b = BatchView<float>(kBatchPackedBOffset, kBatchPackedElements);
+        auto index = BatchView<uint32_t>(kBatchIndexOffset, kBatchInputElements);
+        Duplicate(index, uint32_t(0), kBatchInputElements);
+        PipeBarrier<PIPE_V>();
+        Sort32(a, input, index, 80);
+        PipeBarrier<PIPE_V>();
+        uint16_t length32[4] = {32, 32, 32, 32};
+        uint32_t sorted[4] = {0, 0, 0, 0};
+        MrgSort<float, false>(b, MrgSortSrcList<float>(a[0], a[64], a[128], a[192]),
+            length32, sorted, 15, 20);
+        PipeBarrier<PIPE_V>();
+        uint16_t length128[4] = {128, 128, 128, 128};
+        for (uint32_t j = 0; j < kBatchRows; ++j) {
+            const uint32_t p = kBatchPackedRowWords * j;
+            MrgSort<float, false>(a[p], MrgSortSrcList<float>(b[p], b[p + 256], b[p + 512], b[p + 768]),
+                length128, sorted, 15, 1);
+        }
+        PipeBarrier<PIPE_V>();
+        for (uint32_t j = 0; j < kBatchRows; ++j) {
+            const uint32_t p = kBatchPackedRowWords * j + 1024U;
+            DataCopy(a[p], b[p], 256);
+        }
+        PipeBarrier<PIPE_V>();
+        uint16_t lengthFinal[4] = {512, 128, 0, 0};
+        for (uint32_t j = 0; j < kBatchRows; ++j) {
+            const uint32_t p = kBatchPackedRowWords * j;
+            MrgSort<float, false>(b[p], MrgSortSrcList<float>(a[p], a[p + 1024], a[p], a[p]),
+                lengthFinal, sorted, 3, 1);
+        }
+        PipeBarrier<PIPE_V>();
+        // A ablation: threshold reads packed score fields directly; no Extract.
+        SetFlag<HardEvent::V_S>(0);
+        WaitFlag<HardEvent::V_S>(0);
+    }
+
+    __aicore__ inline bool SelectSortedBatchRow(uint32_t j, uint32_t visible)
+    {
+        auto input = BatchView<float>(kBatchInputOffset + j * kBatchRowBytes, kBatchColumns);
+        auto ordered = BatchView<float>(kBatchPackedBOffset + j * kBatchPackedRowWords * sizeof(float), kBatchPackedRowWords);
+        auto output = BatchView<int32_t>(kBatchOutputOffset + j * kBatchOutputRowBytes, kMaxTopK);
+        auto logical = BatchView<int32_t>(kBatchLogicalOffset, kBatchColumns);
+        auto wide = BatchView<int32_t>(kBatchWideOffset, kBatchColumns);
+        auto floatIds = BatchView<float>(kBatchFloatIdsOffset, kBatchColumns);
+        auto greater = BatchView<uint8_t>(kBatchGreaterOffset, 256);
+        auto equal = BatchView<uint8_t>(kBatchEqualOffset, 256);
+        auto cutoffMask = BatchView<uint8_t>(kBatchCutoffOffset, 256);
+        const float threshold = ordered.GetValue(2U * 511U);
+        const float next = ordered.GetValue(2U * 512U);
+        CreateVecIndex(logical, int32_t(0), 640);
+        uint64_t count = 0;
+        if (threshold > next) {
+            CompareScalar(greater, input, threshold, CMPMODE::GE, 640);
+        } else {
+            uint32_t lo = 0, hi = 512;
+            while (lo < hi) {
+                const uint32_t mid = (lo + hi) / 2;
+                if (ordered.GetValue(2U * mid) > threshold) lo = mid + 1;
+                else hi = mid;
+            }
+            const uint32_t ties = 512U - lo;
+            CompareScalar(greater, input, threshold, CMPMODE::GT, 640);
+            CompareScalar(equal, input, threshold, CMPMODE::EQ, 640);
+            PipeBarrier<PIPE_V>();
+            uint64_t tieCount = 0;
+            GatherMask(wide, logical, equal.ReinterpretCast<uint32_t>(), true, visible, {1, 1, 8, 1}, tieCount);
+            SetFlag<HardEvent::V_S>(0);
+            WaitFlag<HardEvent::V_S>(0);
+            if (ties == 0U || tieCount < ties) return false;
+            const int32_t cutoff = wide.GetValue(ties - 1U);
+            CreateVecIndex(floatIds, 0.0F, 640);
+            CompareScalar(cutoffMask, floatIds, static_cast<float>(cutoff), CMPMODE::LE, 640);
+            PipeBarrier<PIPE_V>();
+            And(equal.ReinterpretCast<uint16_t>(), equal.ReinterpretCast<uint16_t>(),
+                cutoffMask.ReinterpretCast<uint16_t>(), 40);
+            PipeBarrier<PIPE_V>();
+            Or(greater.ReinterpretCast<uint16_t>(), greater.ReinterpretCast<uint16_t>(),
+                equal.ReinterpretCast<uint16_t>(), 40);
+        }
+        PipeBarrier<PIPE_V>();
+        GatherMask(wide, logical, greater.ReinterpretCast<uint32_t>(), true, visible, {1, 1, 8, 1}, count);
+        SetFlag<HardEvent::V_S>(0);
+        WaitFlag<HardEvent::V_S>(0);
+        if (count != 512U) return false;
+        DataCopy(output, wide, 512);
+        PipeBarrier<PIPE_V>();
+        return true;
+    }
+
+    __aicore__ inline bool TrySelectFourRows(uint32_t row)
+    {
+        const uint32_t stride = data_.usedCubeCores * 2U;
+        const uint32_t rows = data_.groups * data_.batchCount;
+        if (row + 3U * stride >= rows) return false;
+        const uint32_t group = row / data_.batchCount;
+        uint32_t tokens[kBatchRows], visible[kBatchRows], firstRequest = 0;
+        for (uint32_t j = 0; j < kBatchRows; ++j) {
+            const uint32_t current = row + j * stride;
+            if (current / data_.batchCount != group) return false;
+            tokens[j] = data_.batchBegin + current % data_.batchCount;
+            uint32_t request = 0;
+            if (!Request(tokens[j], request, visible[j]) || visible[j] < 513U || visible[j] > 639U) return false;
+            if (j == 0U) firstRequest = request;
+            else if (request != firstRequest) return false;
+        }
+        auto input = BatchView<float>(kBatchInputOffset, kBatchInputElements);
+        union { uint32_t bits; float value; } negativeInfinity;
+        negativeInfinity.bits = 0xFF800000U;
+        Duplicate(input, negativeInfinity.value, kBatchInputElements);
+        SetFlag<HardEvent::V_MTE2>(0);
+        WaitFlag<HardEvent::V_MTE2>(0);
+        for (uint32_t j = 0; j < kBatchRows; ++j) {
+            DataCopyExtParams copy{1, visible[j] * 4U, 0, 0, 0};
+            DataCopyPadExtParams<float> pad{true, 0,
+                static_cast<uint8_t>((8U - visible[j] % 8U) % 8U), negativeInfinity.value};
+            DataCopyPad(input[j * kBatchColumns], scores_[ScoreBase(group, tokens[j])], copy, pad);
+        }
+        SetFlag<HardEvent::MTE2_V>(0);
+        WaitFlag<HardEvent::MTE2_V>(0);
+        SortFourRows();
+        // No GM output until every row passes; failed batches may safely
+        // discard all arena views and retry the original per-row selector.
+        for (uint32_t j = 0; j < kBatchRows; ++j) {
+            if (!SelectSortedBatchRow(j, visible[j])) return false;
+        }
+        SetFlag<HardEvent::V_MTE3>(0);
+        WaitFlag<HardEvent::V_MTE3>(0);
+        for (uint32_t j = 0; j < kBatchRows; ++j) {
+            auto output = BatchView<int32_t>(kBatchOutputOffset + j * kBatchOutputRowBytes, kMaxTopK);
+            const uint64_t out = (static_cast<uint64_t>(group) * data_.totalTokens + tokens[j]) * 512U;
+            DataCopyExtParams copy{1, 2048, 0, 0, 0};
+            DataCopyPad(ids_[out], output, copy);
+        }
+        SetFlag<HardEvent::MTE3_S>(0);
+        WaitFlag<HardEvent::MTE3_S>(0);
+        return true;
+    }
+
+    TBuf<TPosition::VECCALC> batchArenaBuffer_;
+    LocalTensor<uint8_t> batchArena_;
+    // A12 aliases: input and packed B remain live through membership.
+    static constexpr uint32_t kLargeRows = 12, kLargeColumns = 640;
+    static constexpr uint32_t kLargeInputElements = 7680, kLargePackedElements = 15360;
+    static constexpr uint32_t kLargePackedRowWords = 1280, kLargeRowBytes = 2560;
+    static constexpr uint32_t kLargeOutputRowBytes = 2048;
+    static constexpr uint32_t kLargeInputOffset = 0, kLargePackedAOffset = 30720;
+    static constexpr uint32_t kLargePackedBOffset = 92160, kLargeOutputOffset = 30720;
+    static constexpr uint32_t kLargeLogicalOffset = 55296, kLargeWideOffset = 57856;
+    static constexpr uint32_t kLargeFloatIdsOffset = 60416, kLargeGreaterOffset = 62976;
+    static constexpr uint32_t kLargeEqualOffset = 63232, kLargeCutoffOffset = 63488;
+
+    __aicore__ inline void SortTwelveRows()
+    {
+        auto input = BatchView<float>(kLargeInputOffset, kLargeInputElements);
+        auto a = BatchView<float>(kLargePackedAOffset, kLargePackedElements);
+        auto b = BatchView<float>(kLargePackedBOffset, kLargePackedElements);
+        auto index = BatchView<uint32_t>(kLargePackedBOffset, kLargeInputElements);
+        Duplicate(index, uint32_t(0), kLargeInputElements);
+        PipeBarrier<PIPE_V>();
+        Sort32(a, input, index, 240);
+        PipeBarrier<PIPE_V>(); // Index storage is dead before B merge output.
+        uint16_t length32[4] = {32, 32, 32, 32};
+        uint32_t sorted[4] = {0, 0, 0, 0};
+        MrgSort<float, false>(b, MrgSortSrcList<float>(a[0], a[64], a[128], a[192]),
+            length32, sorted, 15, 60);
+        PipeBarrier<PIPE_V>();
+        uint16_t length128[4] = {128, 128, 128, 128};
+        for (uint32_t j = 0; j < kLargeRows; ++j) {
+            const uint32_t p = kLargePackedRowWords * j;
+            MrgSort<float, false>(a[p], MrgSortSrcList<float>(b[p], b[p + 256], b[p + 512], b[p + 768]),
+                length128, sorted, 15, 1);
+        }
+        PipeBarrier<PIPE_V>();
+        DataCopyParams tail{};
+        tail.blockCount = kLargeRows;
+        tail.blockLen = 32;
+        tail.srcStride = 128;
+        tail.dstStride = 128;
+        DataCopy(a[1024], b[1024], tail);
+        PipeBarrier<PIPE_V>();
+        uint16_t lengthFinal[4] = {512, 128, 0, 0};
+        for (uint32_t j = 0; j < kLargeRows; ++j) {
+            const uint32_t p = kLargePackedRowWords * j;
+            MrgSort<float, false>(b[p], MrgSortSrcList<float>(a[p], a[p + 1024], a[p], a[p]),
+                lengthFinal, sorted, 3, 1);
+        }
+        SetFlag<HardEvent::V_S>(0);
+        WaitFlag<HardEvent::V_S>(0);
+        // Packed A is now dead and may hold output IDs and membership scratch.
+    }
+
+    __aicore__ inline bool SelectSortedLargeRow(uint32_t j, uint32_t visible)
+    {
+        auto input = BatchView<float>(kLargeInputOffset + j * kLargeRowBytes, kLargeColumns);
+        auto ordered = BatchView<float>(kLargePackedBOffset + j * kLargePackedRowWords * sizeof(float), kLargePackedRowWords);
+        auto output = BatchView<int32_t>(kLargeOutputOffset + j * kLargeOutputRowBytes, kMaxTopK);
+        auto logical = BatchView<int32_t>(kLargeLogicalOffset, kLargeColumns);
+        auto wide = BatchView<int32_t>(kLargeWideOffset, kLargeColumns);
+        auto floatIds = BatchView<float>(kLargeFloatIdsOffset, kLargeColumns);
+        auto greater = BatchView<uint8_t>(kLargeGreaterOffset, 256);
+        auto equal = BatchView<uint8_t>(kLargeEqualOffset, 256);
+        auto cutoffMask = BatchView<uint8_t>(kLargeCutoffOffset, 256);
+        const float threshold = ordered.GetValue(2U * 511U);
+        const float next = ordered.GetValue(2U * 512U);
+        // logical IDs are built once per A12 batch and remain read-only.
+        uint64_t count = 0;
+        if (threshold > next) {
+            CompareScalar(greater, input, threshold, CMPMODE::GE, 640);
+        } else {
+            uint32_t lo = 0, hi = 512;
+            while (lo < hi) {
+                const uint32_t mid = (lo + hi) / 2;
+                if (ordered.GetValue(2U * mid) > threshold) lo = mid + 1;
+                else hi = mid;
+            }
+            const uint32_t ties = 512U - lo;
+            CompareScalar(greater, input, threshold, CMPMODE::GT, 640);
+            CompareScalar(equal, input, threshold, CMPMODE::EQ, 640);
+            PipeBarrier<PIPE_V>();
+            uint64_t tieCount = 0;
+            GatherMask(wide, logical, equal.ReinterpretCast<uint32_t>(), true, visible, {1, 1, 8, 1}, tieCount);
+            SetFlag<HardEvent::V_S>(0);
+            WaitFlag<HardEvent::V_S>(0);
+            if (ties == 0U || tieCount < ties) return false;
+            const int32_t cutoff = wide.GetValue(ties - 1U);
+            CreateVecIndex(floatIds, 0.0F, 640);
+            CompareScalar(cutoffMask, floatIds, static_cast<float>(cutoff), CMPMODE::LE, 640);
+            PipeBarrier<PIPE_V>();
+            And(equal.ReinterpretCast<uint16_t>(), equal.ReinterpretCast<uint16_t>(),
+                cutoffMask.ReinterpretCast<uint16_t>(), 40);
+            PipeBarrier<PIPE_V>();
+            Or(greater.ReinterpretCast<uint16_t>(), greater.ReinterpretCast<uint16_t>(),
+                equal.ReinterpretCast<uint16_t>(), 40);
+        }
+        PipeBarrier<PIPE_V>();
+        GatherMask(wide, logical, greater.ReinterpretCast<uint32_t>(), true, visible, {1, 1, 8, 1}, count);
+        SetFlag<HardEvent::V_S>(0);
+        WaitFlag<HardEvent::V_S>(0);
+        if (count != 512U) return false;
+        DataCopy(output, wide, 512);
+        PipeBarrier<PIPE_V>();
+        return true;
+    }
+
+
+    __aicore__ inline bool TrySelectTwelveRows(uint32_t row)
+    {
+        const uint32_t stride = data_.usedCubeCores * 2U;
+        const uint32_t rows = data_.groups * data_.batchCount;
+        if (row >= rows || rows - 1U - row < (kLargeRows - 1U) * stride) return false;
+        const uint32_t group = row / data_.batchCount;
+        uint32_t tokens[kLargeRows], visible[kLargeRows], firstRequest = 0;
+        for (uint32_t j = 0; j < kLargeRows; ++j) {
+            const uint32_t current = row + j * stride;
+            if (current / data_.batchCount != group) return false;
+            tokens[j] = data_.batchBegin + current % data_.batchCount;
+            uint32_t request = 0;
+            if (!Request(tokens[j], request, visible[j]) || visible[j] < 513U || visible[j] > 639U) return false;
+            if (j == 0U) firstRequest = request;
+            else if (request != firstRequest) return false;
+        }
+        auto input = BatchView<float>(kLargeInputOffset, kLargeInputElements);
+        union { uint32_t bits; float value; } negativeInfinity;
+        negativeInfinity.bits = 0xFF800000U;
+        Duplicate(input, negativeInfinity.value, kLargeInputElements);
+        SetFlag<HardEvent::V_MTE2>(0);
+        WaitFlag<HardEvent::V_MTE2>(0);
+        for (uint32_t j = 0; j < kLargeRows; ++j) {
+            DataCopyExtParams copy{1, visible[j] * 4U, 0, 0, 0};
+            DataCopyPadExtParams<float> pad{true, 0,
+                static_cast<uint8_t>((8U - visible[j] % 8U) % 8U), negativeInfinity.value};
+            DataCopyPad(input[j * kLargeColumns], scores_[ScoreBase(group, tokens[j])], copy, pad);
+        }
+        SetFlag<HardEvent::MTE2_V>(0);
+        WaitFlag<HardEvent::MTE2_V>(0);
+        SortTwelveRows();
+        auto logical = BatchView<int32_t>(kLargeLogicalOffset, kLargeColumns);
+        CreateVecIndex(logical, int32_t(0), kLargeColumns);
+        PipeBarrier<PIPE_V>();
+        // No GM output until every row passes; failed batches may safely
+        // discard all arena views and retry the original per-row selector.
+        for (uint32_t j = 0; j < kLargeRows; ++j) {
+            if (!SelectSortedLargeRow(j, visible[j])) return false;
+        }
+        SetFlag<HardEvent::V_MTE3>(0);
+        WaitFlag<HardEvent::V_MTE3>(0);
+        auto output = BatchView<int32_t>(kLargeOutputOffset, kLargeRows * kMaxTopK);
+        if (stride - 1U <= UINT32_MAX / kLargeOutputRowBytes) {
+            const uint64_t out = (static_cast<uint64_t>(group) * data_.totalTokens + tokens[0]) * kMaxTopK;
+            DataCopyExtParams copy{static_cast<uint16_t>(kLargeRows), kLargeOutputRowBytes, 0,
+                (stride - 1U) * kLargeOutputRowBytes, 0};
+            DataCopyPad(ids_[out], output, copy);
+        } else {
+            for (uint32_t j = 0; j < kLargeRows; ++j) {
+                const uint64_t out = (static_cast<uint64_t>(group) * data_.totalTokens + tokens[j]) * kMaxTopK;
+                DataCopyExtParams copy{1, kLargeOutputRowBytes, 0, 0, 0};
+                DataCopyPad(ids_[out], output[j * kMaxTopK], copy);
+            }
+        }
+        SetFlag<HardEvent::MTE3_S>(0);
+        WaitFlag<HardEvent::MTE3_S>(0);
+        return true;
+    }
+
 
     PagedTilingData data_{};
     TPipe *pipe_ = nullptr;
