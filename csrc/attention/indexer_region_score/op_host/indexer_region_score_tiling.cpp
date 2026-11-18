@@ -21,7 +21,8 @@ ge::graphStatus Tiling(gert::TilingContext *context)
 {
     OP_CHECK_NULL_WITH_CONTEXT(context, context->GetPlatformInfo());
     platform_ascendc::PlatformAscendC target(context->GetPlatformInfo());
-    if (target.GetSocVersion() == platform_ascendc::SocVersion::ASCEND910_93) {
+    if (target.GetSocVersion() == platform_ascendc::SocVersion::ASCEND910_93 ||
+        target.GetSocVersion() == platform_ascendc::SocVersion::ASCEND910B) {
         return IndexerRegionScoreA3Tiling::Tiling(context);
     }
     const auto *attrs = context->GetAttrs();

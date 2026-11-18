@@ -4,6 +4,8 @@
 #include <ATen/ATen.h>
 #include <ATen/MemoryOverlap.h>
 #include <cmath>
+#include <cstdint>
+#include "indexer_region_score_dispatch.h"
 namespace vllm_ascend {
 inline void npu_indexer_region_score_ids_out(
     const at::Tensor &query, const at::Tensor &weights, const at::Tensor &key,
@@ -12,6 +14,7 @@ inline void npu_indexer_region_score_ids_out(
     int64_t cacheMode, int64_t maskMode, int64_t sortMode, const at::Tensor &selectedIds)
 {
     constexpr int64_t MIN_HEADS = 4, MAX_HEADS = 128, DIM = 256, MAX_REGIONS = 16777216, MAX_TOP_K = 512;
+    constexpr uintptr_t IO_ALIGNMENT_BYTES = 32;
     TORCH_CHECK(query.device().is_privateuseone(), "indexer_region_score expects NPU inputs");
     TORCH_CHECK(cacheMode == 1 && maskMode == 3 && sortMode == 1,
         "only cache_mode=1, mask_mode=3 and sort_mode=1 are supported");
@@ -51,8 +54,19 @@ inline void npu_indexer_region_score_ids_out(
     at::assert_no_internal_overlap(selectedIds);
     for (const auto *input : inputs) at::assert_no_overlap(selectedIds, *input);
     const c10_npu::OptionalNPUGuard deviceGuard(query.device());
-    const c10::optional<at::Tensor> scoreOutput = c10::nullopt;
-    EXEC_NPU_CMD(aclnnIndexerRegionScore, query, weights, key, lengths, table, cu,
-        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, scoreOutput, selectedIds);
+    if (!selectedIds.is_contiguous() ||
+        reinterpret_cast<uintptr_t>(selectedIds.data_ptr()) % IO_ALIGNMENT_BYTES != 0) {
+        // CANN ViewCopy cannot reliably write arbitrary caller views. Keep the
+        // native output dense and let PyTorch handle the destination strides.
+        auto temporary = at::empty(selectedIds.sizes(), selectedIds.options());
+        indexer_region_score_detail::Dispatch(query, weights, key, lengths, table, cu,
+            regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, temporary);
+        c10_npu::NPUCachingAllocator::recordStream(
+            selectedIds.storage().data_ptr(), c10_npu::getCurrentNPUStream());
+        selectedIds.copy_(temporary);
+        return;
+    }
+    indexer_region_score_detail::Dispatch(query, weights, key, lengths, table, cu,
+        regions, topK, regionSize, headScale, cacheMode, maskMode, sortMode, selectedIds);
 }
 } // namespace vllm_ascend

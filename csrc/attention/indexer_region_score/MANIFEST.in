@@ -1,0 +1,11 @@
+include setup.py pyproject.toml README.md
+include indexer_region_score_torch_adpt.h indexer_region_score_dispatch.h
+recursive-include packaging *.txt *.cmake *.h
+recursive-include op_host *.cpp *.h
+recursive-include op_kernel *.cpp *.h
+recursive-include vllm_ascend_indexer *.py *.cpp *.h
+recursive-include examples *.py
+recursive-include tests *.py
+prune build
+prune vllm_ascend_indexer/_cann_ops_custom
+global-exclude *.pyc *.o *.so
